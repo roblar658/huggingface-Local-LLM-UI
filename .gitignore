@@ -6,3 +6,4 @@
 *.pdb
 inspect_gguf*
 tools/**/obj/
+tools/**/bin/
