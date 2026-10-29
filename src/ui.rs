@@ -33,6 +33,7 @@ pub enum AppEvent {
     InferenceCancelled,
     InferenceError(String),
     CompositePromptReady(String),
+    InferenceStatus(String),
     ImagePasted(Result<(usize, PathBuf, PathBuf, usize, usize), String>),
 }
 
@@ -85,6 +86,7 @@ pub struct HfAssistantApp {
     max_tokens: usize,
     use_context: bool,
     enable_ocr_paste: bool,
+    auto_evaluate_and_continue: bool,
     attached_images: Vec<AttachedImage>,
     next_image_id: usize,
     is_pasting_image: bool,
@@ -135,6 +137,7 @@ impl HfAssistantApp {
             max_tokens: 500,
             use_context: true,
             enable_ocr_paste: true,
+            auto_evaluate_and_continue: true,
             attached_images: Vec::new(),
             next_image_id: 1,
             is_pasting_image: false,
@@ -341,6 +344,7 @@ impl HfAssistantApp {
         let disable_think = self.disable_thinking_tags;
         let cancel_arc = self.cancel_flag.clone();
         let use_context = self.use_context;
+        let auto_eval = self.auto_evaluate_and_continue;
         let history_snapshot = self.chat_history.clone();
 
         thread::spawn(move || {
@@ -403,7 +407,7 @@ impl HfAssistantApp {
 
                 (full_prompt, full_sys)
             } else {
-                (final_prompt, base_system_prompt)
+                (final_prompt.clone(), base_system_prompt)
             };
 
             // 3. Utfør inferens
@@ -411,6 +415,9 @@ impl HfAssistantApp {
             if let Some(ref mut llm) = *guard {
                 let tx_token = tx.clone();
                 let cancel_for_cb = cancel_arc.clone();
+                let first_answer_ref = Arc::new(Mutex::new(String::new()));
+                let first_ans_cb = first_answer_ref.clone();
+
                 let res = llm.generate_with_callback(
                     &sys_to_send,
                     disable_think,
@@ -423,6 +430,9 @@ impl HfAssistantApp {
                         if cancel_for_cb.load(Ordering::Relaxed) {
                             return false;
                         }
+                        if let Ok(mut g) = first_ans_cb.lock() {
+                            g.push_str(&token);
+                        }
                         let _ = tx_token.send(AppEvent::InferenceToken(token.to_string()));
                         true
                     },
@@ -430,6 +440,7 @@ impl HfAssistantApp {
 
                 if cancel_arc.load(Ordering::Relaxed) {
                     let _ = tx.send(AppEvent::InferenceCancelled);
+                    return;
                 } else if let Err(e) = res {
                     let msg = e.to_string();
                     if msg.contains("Avbrutt av bruker") {
@@ -437,9 +448,110 @@ impl HfAssistantApp {
                     } else {
                         let _ = tx.send(AppEvent::InferenceError(msg));
                     }
-                } else {
-                    let _ = tx.send(AppEvent::InferenceFinished);
+                    return;
                 }
+
+                // 4. Automatisk vurdering og fortsettelse (om aktivert)
+                let first_ans = first_answer_ref.lock().unwrap().clone();
+                let first_ans_trimmed = first_ans.trim();
+
+                if auto_eval && !first_ans_trimmed.is_empty() {
+                    let _ = tx.send(AppEvent::InferenceStatus(
+                        "Vurderer automatisk om svaret er godt nok og fullstendig...".to_string(),
+                    ));
+
+                    let eval_sys = "Du er en objektiv og grundig evaluator. Vurder om svaret under er godt nok og tilstrekkelig besvart på brukerens henvendelse. Dersom svaret er komplett og godt nok, svar kun: GODT_NOK. Dersom svaret IKKE er godt nok, er avbrutt eller mangler viktige opplysninger, skriv FORTSETTELSE: etterfulgt av den manglende teksten for å fullføre svaret.";
+
+                    let eval_prompt = format!(
+                        "Brukerprompt: {}\n\nGenerert svar: {}\n\nOppgave: Vurder om svaret ovenfor er godt nok og fullstendig besvart. Svar GODT_NOK hvis det er fullstendig, eller FORTSETTELSE: etterfulgt av fortsettelsen hvis det må fullføres.",
+                        final_prompt,
+                        first_ans_trimmed
+                    );
+
+                    let tx_eval_token = tx.clone();
+                    let tx_eval_status = tx.clone();
+                    let cancel_eval = cancel_arc.clone();
+                    let mut eval_buffer = String::new();
+                    let mut is_continuing = false;
+                    let mut separator_emitted = false;
+
+                    let eval_res = llm.generate_with_callback(
+                        eval_sys,
+                        true,
+                        &eval_prompt,
+                        max_toks,
+                        temp,
+                        p,
+                        Some(cancel_arc.as_ref()),
+                        move |token| {
+                            if cancel_eval.load(Ordering::Relaxed) {
+                                return false;
+                            }
+
+                            if !is_continuing {
+                                eval_buffer.push_str(&token);
+                                let upper = eval_buffer.to_uppercase();
+
+                                if upper.contains("GODT_NOK") || upper.contains("GODT NOK") {
+                                    let _ = tx_eval_status.send(AppEvent::InferenceStatus(
+                                        "Vurdert: Svaret er godt nok og fullstendig.".to_string(),
+                                    ));
+                                    return false; // Fullført!
+                                }
+
+                                if let Some(pos) = upper.find("FORTSETTELSE:").or_else(|| upper.find("FORTSETT:")) {
+                                    is_continuing = true;
+                                    if !separator_emitted {
+                                        separator_emitted = true;
+                                        let _ = tx_eval_status.send(AppEvent::InferenceStatus(
+                                            "Svaret var ufullstendig – fortsetter og fullfører automatisk...".to_string(),
+                                        ));
+                                        let _ = tx_eval_token.send(AppEvent::InferenceToken(
+                                            "\n\n**Fortsettelse:**\n".to_string(),
+                                        ));
+                                        let kw_len = if upper[pos..].starts_with("FORTSETTELSE:") { 13 } else { 9 };
+                                        let rest = eval_buffer[pos + kw_len..].trim_start();
+                                        if !rest.is_empty() {
+                                            let _ = tx_eval_token.send(AppEvent::InferenceToken(rest.to_string()));
+                                        }
+                                    }
+                                } else if eval_buffer.len() > 50 {
+                                    is_continuing = true;
+                                    if !separator_emitted {
+                                        separator_emitted = true;
+                                        let _ = tx_eval_status.send(AppEvent::InferenceStatus(
+                                            "Utdyper og fullfører svaret automatisk...".to_string(),
+                                        ));
+                                        let _ = tx_eval_token.send(AppEvent::InferenceToken(
+                                            "\n\n**Utdypning:**\n".to_string(),
+                                        ));
+                                        let trimmed = eval_buffer.trim();
+                                        if !trimmed.is_empty() {
+                                            let _ = tx_eval_token.send(AppEvent::InferenceToken(trimmed.to_string()));
+                                        }
+                                    }
+                                }
+                            } else {
+                                let _ = tx_eval_token.send(AppEvent::InferenceToken(token.to_string()));
+                            }
+
+                            true
+                        },
+                    );
+
+                    if cancel_arc.load(Ordering::Relaxed) {
+                        let _ = tx.send(AppEvent::InferenceCancelled);
+                        return;
+                    } else if let Err(e) = eval_res {
+                        let msg = e.to_string();
+                        if msg.contains("Avbrutt av bruker") {
+                            let _ = tx.send(AppEvent::InferenceCancelled);
+                            return;
+                        }
+                    }
+                }
+
+                let _ = tx.send(AppEvent::InferenceFinished);
             } else {
                 let _ = tx.send(AppEvent::InferenceError(
                     "Ingen modell er lastet inn i minnet enda. Gå til 'Nedlastinger & Lokale Modeller' og klikk 'Last inn & Åpne i Chat'.".to_string(),
@@ -552,6 +664,9 @@ impl eframe::App for HfAssistantApp {
                         }
                     }
                 }
+                AppEvent::InferenceStatus(status) => {
+                    self.status_msg = status;
+                }
                 AppEvent::InferenceToken(token) => {
                     if let Some((_, text)) = self.chat_history.last_mut() {
                         text.push_str(&token);
@@ -559,7 +674,9 @@ impl eframe::App for HfAssistantApp {
                 }
                 AppEvent::InferenceFinished => {
                     self.is_generating = false;
-                    self.status_msg = "Generering fullført.".to_string();
+                    if self.status_msg.starts_with("Generer") || self.status_msg.starts_with("Vurder") {
+                        self.status_msg = "Generering og vurdering fullført.".to_string();
+                    }
                 }
                 AppEvent::InferenceCancelled => {
                     self.is_generating = false;
@@ -1211,6 +1328,13 @@ impl HfAssistantApp {
             )
             .on_hover_text(
                 "Tillater innliming av bilder (fra utklippstavlen eller skjermklipp) som oversettes til tekst via Windows OCR og brukes som prompt.",
+            );
+            ui.checkbox(
+                &mut self.auto_evaluate_and_continue,
+                egui::RichText::new("Auto-vurder & fortsett").color(egui::Color32::WHITE),
+            )
+            .on_hover_text(
+                "Når AI er ferdig, vurderer den automatisk om svaret er godt nok. Hvis ikke, bes den automatisk om å fortsette og fullføre svaret.",
             );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
