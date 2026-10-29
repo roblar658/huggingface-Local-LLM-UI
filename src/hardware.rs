@@ -110,9 +110,10 @@ impl ResourceSnapshot {
                 String::new()
             };
             format!(
-                "{} [GPU: {:.1} GB i VRAM ({}% last{}) | {}/{} tråder | {:.1} GB RAM ledig]",
+                "{} [GPU: {:.1} GB i VRAM ({:.1} GB ledig, {}% last{}) | {}/{} tråder | {:.1} GB RAM ledig]",
                 mode_str,
                 self.gpu_offloaded_mb as f64 / 1024.0,
+                self.gpu_vram_free_mb as f64 / 1024.0,
                 self.gpu_util_pct,
                 temp_part,
                 self.recommended_threads,
@@ -142,6 +143,7 @@ pub struct ResourceGovernor {
     pool_balanced: rayon::ThreadPool,
     pool_low: rayon::ThreadPool,
     pool_minimal: rayon::ThreadPool,
+    last_pause: std::sync::Mutex<std::time::Instant>,
 }
 
 impl ResourceGovernor {
@@ -195,6 +197,9 @@ impl ResourceGovernor {
             pool_balanced,
             pool_low,
             pool_minimal,
+            last_pause: std::sync::Mutex::new(
+                std::time::Instant::now() - std::time::Duration::from_secs(10),
+            ),
         }
     }
 
@@ -218,35 +223,34 @@ impl ResourceGovernor {
             (false, 0)
         };
 
-        let vram_critical = tel.vram_total_mb > 0 && tel.vram_free_mb < 320;
-        let vram_low = tel.vram_total_mb > 0 && tel.vram_free_mb < 700;
-        let gpu_hot_crit = tel.temp_c >= 87;
-        let gpu_hot_low = tel.temp_c >= 83;
+        // Merk: GPU-inferens allokerer 0 bytes ny VRAM under kjøring (alt ligger i fast workspace).
+        // Lav ledig VRAM skal derfor ALDRI låse tråden i CriticalPause, kun justere GPU-grid skånsomt.
+        let vram_tight = tel.vram_total_mb > 0 && tel.vram_free_mb < 450;
+        let gpu_hot_crit = tel.temp_c >= 89;
+        let gpu_hot_low = tel.temp_c >= 84;
         let gpu_hot_bal = tel.temp_c >= 79;
 
         let (level, recommended_threads, prefill_chunk_size, throttle_sleep_ms) =
-            if avail_phys_mb < 480
-                || avail_page_file_mb < 480
-                || memory_load_pct >= 96
-                || vram_critical
+            if (avail_phys_mb < 350 && memory_load_pct >= 97)
+                || avail_page_file_mb < 350
                 || gpu_hot_crit
             {
-                (ResourceLevel::CriticalPause, 1, 4, 45)
-            } else if avail_phys_mb < 1050
-                || avail_page_file_mb < 950
-                || memory_load_pct >= 90
-                || vram_low
+                (ResourceLevel::CriticalPause, 1, 8, 15)
+            } else if avail_phys_mb < 900
+                || avail_page_file_mb < 800
+                || memory_load_pct >= 92
                 || gpu_hot_low
             {
-                (ResourceLevel::LowResources, self.low_threads, 8, 12)
+                (ResourceLevel::LowResources, self.low_threads, 12, 6)
             } else if !app_focused
-                || avail_phys_mb < 2000
-                || avail_page_file_mb < 1800
-                || memory_load_pct >= 82
+                || avail_phys_mb < 1800
+                || avail_page_file_mb < 1600
+                || memory_load_pct >= 85
                 || gpu_hot_bal
+                || vram_tight
             {
-                let sleep_ms = if !app_focused { 2 } else { 3 };
-                (ResourceLevel::Balanced, self.balanced_threads, 16, sleep_ms)
+                let sleep_ms = if !app_focused { 1 } else { 2 };
+                (ResourceLevel::Balanced, self.balanced_threads, 20, sleep_ms)
             } else {
                 (ResourceLevel::OptimalSubMax, self.submax_threads, 32, 0)
             };
@@ -322,25 +326,24 @@ impl ResourceGovernor {
         match snap.level {
             ResourceLevel::CriticalPause => {
                 trim_process_working_set();
-                for step in 0..15 {
-                    if let Some(flag) = cancel_flag {
-                        if flag.load(Ordering::Relaxed) {
-                            return Err(anyhow!("Generering avbrutt av bruker."));
-                        }
+                let should_pause = if let Ok(mut last) = self.last_pause.lock() {
+                    if last.elapsed() >= std::time::Duration::from_secs(4) {
+                        *last = std::time::Instant::now();
+                        true
+                    } else {
+                        false
                     }
-                    if step == 0 || step % 5 == 0 {
-                        on_status(&format!(
-                            "Høy belastning ({} MB RAM ledig, {} MB VRAM ledig) – tar en kort automatisk pause for å unngå heng...",
-                            snap.avail_phys_mb, snap.gpu_vram_free_mb
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
+                } else {
+                    false
+                };
+                if should_pause {
+                    on_status(&format!(
+                        "Frigjør systemminne ({} MB RAM ledig) – fortsetter i skånsom modus...",
+                        snap.avail_phys_mb
+                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(220));
                     snap = self.sample();
-                    if snap.level != ResourceLevel::CriticalPause {
-                        break;
-                    }
-                }
-                if snap.level == ResourceLevel::CriticalPause {
+                } else {
                     std::thread::sleep(std::time::Duration::from_millis(snap.throttle_sleep_ms));
                 }
             }

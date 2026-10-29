@@ -1203,6 +1203,9 @@ impl HfAssistantApp {
     }
 
     fn load_selected_model(&mut self) {
+        if self.is_loading_llm {
+            return;
+        }
         if let Some(ref path) = self.selected_llm_path {
             let p_clone = path.clone();
             let arc_llm = self.loaded_llm.clone();

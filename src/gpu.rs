@@ -420,9 +420,25 @@ impl CudaEngine {
             if (self.cu_mem_get_info)(&mut free_vram, &mut total_vram) != 0 {
                 return None;
             }
+            // På Windows WDDM kan cuMemGetInfo inkludere delt minne; bruk faktisk fysisk ledig VRAM fra NVML
+            if let Some(tel) = query_gpu_telemetry() {
+                if tel.vram_total_mb > 0 {
+                    let nvml_free = (tel.vram_free_mb as usize) * 1024 * 1024;
+                    let nvml_total = (tel.vram_total_mb as usize) * 1024 * 1024;
+                    free_vram = free_vram.min(nvml_free);
+                    total_vram = total_vram.max(nvml_total);
+                }
+            }
 
-            // Trygg sub-maksimal VRAM-reserve: minst 1200 MB eller 15% av total VRAM holdes alltid ledig
-            let safety_reserve = (total_vram / 7).max(1200 * 1024 * 1024);
+            // Trygg sub-maksimal VRAM-kvote: bruk maks 58% av total VRAM til vekter,
+            // og hold alltid minst 1600 MB (eller 20% av total VRAM) fysisk ledig!
+            let max_offload_bytes = (total_vram * 58) / 100;
+            let current_offloaded = self.offloaded_bytes.load(Ordering::Relaxed);
+            if current_offloaded + bytes.len() > max_offload_bytes {
+                return None;
+            }
+
+            let safety_reserve = (total_vram / 5).max(1600 * 1024 * 1024);
             if free_vram <= bytes.len() + safety_reserve {
                 return None;
             }
