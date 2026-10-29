@@ -438,7 +438,11 @@ impl eframe::App for HfAssistantApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.heading("🤖 Hugging Face Local Assistant");
+                ui.heading(
+                    egui::RichText::new("🤖 Hugging Face Local Assistant")
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                );
                 ui.label(
                     egui::RichText::new("Windows / Rust GUI")
                         .color(egui::Color32::from_rgb(0, 180, 255))
@@ -588,7 +592,12 @@ impl HfAssistantApp {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            ui.label(egui::RichText::new(&m.id).strong().size(15.0));
+                            ui.label(
+                                egui::RichText::new(&m.id)
+                                    .color(egui::Color32::WHITE)
+                                    .strong()
+                                    .size(15.0),
+                            );
 
                             ui.horizontal(|ui| {
                                 if let Some(ref a) = assessment {
@@ -671,8 +680,15 @@ impl HfAssistantApp {
     }
 
     fn render_downloads_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Nedlastede modeller i C:\\dev\\hf_local_assistant\\models");
-        ui.label("Her vises alle .gguf-modeller du har lastet ned lokalt på maskinen.");
+        ui.heading(
+            egui::RichText::new("Nedlastede modeller i C:\\dev\\hf_local_assistant\\models")
+                .color(egui::Color32::WHITE)
+                .strong(),
+        );
+        ui.colored_label(
+            egui::Color32::from_gray(225),
+            "Her vises alle .gguf-modeller du har lastet ned lokalt på maskinen.",
+        );
         ui.separator();
 
         let models_dir = Path::new("models");
@@ -687,7 +703,10 @@ impl HfAssistantApp {
         }
 
         if local_files.is_empty() {
-            ui.label("Ingen modeller er lastet ned enda. Gå til fanen 'Utforsk HF Modeller' for å laste ned en modell.");
+            ui.colored_label(
+                egui::Color32::WHITE,
+                "Ingen modeller er lastet ned enda. Gå til fanen 'Utforsk HF Modeller' for å laste ned en modell.",
+            );
         } else {
             for path in local_files {
                 let fname = path
@@ -704,6 +723,7 @@ impl HfAssistantApp {
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(format!("📦 {} ({:.2} GB)", fname, size_gb))
+                                .color(egui::Color32::WHITE)
                                 .strong(),
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -721,13 +741,24 @@ impl HfAssistantApp {
     }
 
     fn render_system_prompt_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading("System Prompt (Vurdering før bruk)");
-        ui.label("Her kan du vurdere, tilpasse og godkjenne System Promptet som styrer modellens oppførsel i chatten.");
+        ui.heading(
+            egui::RichText::new("System Prompt (Vurdering før bruk)")
+                .color(egui::Color32::WHITE)
+                .strong(),
+        );
+        ui.colored_label(
+            egui::Color32::from_gray(225),
+            "Her kan du vurdere, tilpasse og godkjenne System Promptet som styrer modellens oppførsel i chatten.",
+        );
         ui.separator();
 
         ui.group(|ui| {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Status:").strong());
+                ui.label(
+                    egui::RichText::new("Status:")
+                        .color(egui::Color32::WHITE)
+                        .strong(),
+                );
                 if self.system_prompt_approved {
                     ui.colored_label(
                         egui::Color32::from_rgb(50, 220, 100),
@@ -745,7 +776,11 @@ impl HfAssistantApp {
         ui.add_space(6.0);
 
         ui.group(|ui| {
-            ui.label(egui::RichText::new("Hurtigmaler:").strong());
+            ui.label(
+                egui::RichText::new("Hurtigmaler:")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            );
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Standard (Kortfattet 1–2 setninger)").clicked() {
                     self.system_prompt = "Du er en ekstremt kortfattet assistent. Svar kun med selve svaret på norsk i maksimalt 1–2 korte setninger uten innledning. Om ikke mulig, øk antall setninger med 1 inntil det gir mening.".to_string();
@@ -766,7 +801,11 @@ impl HfAssistantApp {
             });
 
             ui.separator();
-            ui.label(egui::RichText::new("System Prompt-tekst:").strong());
+            ui.label(
+                egui::RichText::new("System Prompt-tekst:")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            );
             let resp = ui.add_sized(
                 [ui.available_width(), 110.0],
                 egui::TextEdit::multiline(&mut self.system_prompt)
@@ -781,7 +820,10 @@ impl HfAssistantApp {
             if ui
                 .checkbox(
                     &mut self.disable_thinking_tags,
-                    "Hopp over intern tenkeblokk (<think>...</think>) for raskere, direkte svar",
+                    egui::RichText::new(
+                        "Hopp over intern tenkeblokk (<think>...</think>) for raskere, direkte svar",
+                    )
+                    .color(egui::Color32::from_gray(230)),
                 )
                 .changed()
             {
@@ -798,27 +840,40 @@ impl HfAssistantApp {
         let has_lang = lower.contains("norsk") || lower.contains("engelsk") || lower.contains("språk");
 
         ui.group(|ui| {
-            ui.label(egui::RichText::new("Vurdering av System Prompt:").strong());
-            ui.label(format!(
-                "• Størrelse: {} ord ({} tegn, ca. {} prefill-tokens per melding)",
-                words, chars, est_tokens
-            ));
-            ui.label(format!(
-                "• Språkinstruks: {}",
-                if has_lang {
-                    "Spesifisert (sikrer at modellen holder seg til valgt språk)"
-                } else {
-                    "Ikke spesifisert (modellen kan svare på engelsk)"
-                }
-            ));
-            ui.label(format!(
-                "• Tenkeblokk (<think>): {}",
-                if self.disable_thinking_tags {
-                    "Deaktivert (gir raskest mulig svar)"
-                } else {
-                    "Aktivert (modellen tenker høyt før svaret)"
-                }
-            ));
+            ui.label(
+                egui::RichText::new("Vurdering av System Prompt:")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            );
+            ui.colored_label(
+                egui::Color32::from_gray(230),
+                format!(
+                    "• Størrelse: {} ord ({} tegn, ca. {} prefill-tokens per melding)",
+                    words, chars, est_tokens
+                ),
+            );
+            ui.colored_label(
+                egui::Color32::from_gray(230),
+                format!(
+                    "• Språkinstruks: {}",
+                    if has_lang {
+                        "Spesifisert (sikrer at modellen holder seg til valgt språk)"
+                    } else {
+                        "Ikke spesifisert (modellen kan svare på engelsk)"
+                    }
+                ),
+            );
+            ui.colored_label(
+                egui::Color32::from_gray(230),
+                format!(
+                    "• Tenkeblokk (<think>): {}",
+                    if self.disable_thinking_tags {
+                        "Deaktivert (gir raskest mulig svar)"
+                    } else {
+                        "Aktivert (modellen tenker høyt før svaret)"
+                    }
+                ),
+            );
         });
 
         ui.add_space(8.0);
@@ -892,7 +947,11 @@ impl HfAssistantApp {
 
     fn render_chat_tab(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("Lokal Chat & Prompting");
+            ui.heading(
+                egui::RichText::new("Lokal Chat & Prompting")
+                    .color(egui::Color32::WHITE)
+                    .strong(),
+            );
             if let Some(ref p) = self.selected_llm_path {
                 ui.colored_label(
                     egui::Color32::from_rgb(0, 200, 100),
@@ -931,9 +990,9 @@ impl HfAssistantApp {
         }
 
         ui.horizontal(|ui| {
-            ui.label("Temperatur:");
+            ui.colored_label(egui::Color32::WHITE, "Temperatur:");
             ui.add(egui::Slider::new(&mut self.temperature, 0.1..=1.5));
-            ui.label("Max Tokens:");
+            ui.colored_label(egui::Color32::WHITE, "Max Tokens:");
             ui.add(egui::Slider::new(&mut self.max_tokens, 50..=1000));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⚙️ System Prompt").clicked() {
