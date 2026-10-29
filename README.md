@@ -48,6 +48,7 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
   - Dedikert fane for vurdering, justering og forhåndsgodkjenning av systeminstruksjoner (System Prompt).
   - Samtalepanel med høykontrast-tekst, justerbare inferensparametere og avbryt-funksjon.
   - Samtalekontekst med støtte for fler-stegs samtaler formatert kronologisk med `[bruker]` og `[AI]` adskilt med mellomrom, samt tilhørende tolkningsinstruks i System Prompt.
+  - Integrert optisk tegngjenkjenning (OCR): Valgfri mulighet for å lime inn bilder fra utklippstavlen (f.eks. skjermklipp via Win+Shift+S) eller bildefiler. Teksten analyseres med RapidOCR (PP-OCRv4 neural ONNX-modell med fallback til Windows Media OCR) med nøyaktig bevaring av visuelle linjeskift og avsnitt, og settes direkte inn i promptfeltet.
   - Egen funksjon for øyeblikkelig nullstilling av samtalelogg (Reset chat).
 - **Kommandolinjegrensesnitt (CLI)**: Støtte for ren terminalbasert interaksjon via flagget `--cli` med støtte for samtalehistorikk og `reset`-kommando.
 

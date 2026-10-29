@@ -5,3 +5,4 @@
 *.dll
 *.pdb
 inspect_gguf*
+tools/**/obj/

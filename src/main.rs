@@ -2,6 +2,7 @@ mod downloader;
 mod hardware;
 mod hf_client;
 mod inference;
+mod ocr;
 mod recommender;
 mod ui;
 

@@ -32,6 +32,7 @@ pub enum AppEvent {
     InferenceFinished,
     InferenceCancelled,
     InferenceError(String),
+    OcrFinished(Result<String, String>),
 }
 
 pub struct HfAssistantApp {
@@ -74,6 +75,8 @@ pub struct HfAssistantApp {
     top_p: f32,
     max_tokens: usize,
     use_context: bool,
+    enable_ocr_paste: bool,
+    is_running_ocr: bool,
     is_generating: bool,
     cancel_flag: Arc<AtomicBool>,
 }
@@ -120,6 +123,8 @@ impl HfAssistantApp {
             top_p: 0.9,
             max_tokens: 250,
             use_context: true,
+            enable_ocr_paste: true,
+            is_running_ocr: false,
             is_generating: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         };
@@ -239,6 +244,20 @@ impl HfAssistantApp {
         }
     }
 
+    fn start_clipboard_ocr(&mut self) {
+        if self.is_running_ocr {
+            return;
+        }
+        self.is_running_ocr = true;
+        self.status_msg =
+            "Leser bilde fra utklippstavlen og gjenkjenner tekst med Windows OCR...".to_string();
+        let tx = self.event_tx.clone();
+        thread::spawn(move || {
+            let res = crate::ocr::OcrEngine::recognize_clipboard();
+            let _ = tx.send(AppEvent::OcrFinished(res.map_err(|e| e.to_string())));
+        });
+    }
+
     fn send_prompt(&mut self) {
         if !self.system_prompt_approved {
             self.status_msg =
@@ -344,6 +363,12 @@ impl HfAssistantApp {
 
 impl eframe::App for HfAssistantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.enable_ocr_paste
+            && !self.is_running_ocr
+            && ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::V))
+        {
+            self.start_clipboard_ocr();
+        }
         if self.is_generating && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_generation();
         }
@@ -461,6 +486,28 @@ impl eframe::App for HfAssistantApp {
                     self.status_msg = format!("Inferens-feil: {}", err);
                     if let Some((_, text)) = self.chat_history.last_mut() {
                         text.push_str(&format!("\n[Feil: {}]", err));
+                    }
+                }
+                AppEvent::OcrFinished(res) => {
+                    self.is_running_ocr = false;
+                    match res {
+                        Ok(text) => {
+                            let trimmed = text.trim();
+                            if !trimmed.is_empty() {
+                                if self.current_prompt.is_empty() {
+                                    self.current_prompt = trimmed.to_string();
+                                } else {
+                                    self.current_prompt.push_str("\n\n");
+                                    self.current_prompt.push_str(trimmed);
+                                }
+                                self.status_msg =
+                                    "OCR fullført: Tekst med linjeskift fra bildet er limt inn i prompten."
+                                        .to_string();
+                            }
+                        }
+                        Err(err) => {
+                            self.status_msg = format!("OCR-feil: {}", err);
+                        }
                     }
                 }
             }
@@ -1056,6 +1103,13 @@ impl HfAssistantApp {
             .on_hover_text(
                 "Inkluderer tidligere meldinger formatert med [bruker] og [AI] adskilt med mellomrom samt instruksjon i System Prompt.",
             );
+            ui.checkbox(
+                &mut self.enable_ocr_paste,
+                egui::RichText::new("Bilde-OCR").color(egui::Color32::WHITE),
+            )
+            .on_hover_text(
+                "Tillater innliming av bilder (fra utklippstavlen eller skjermklipp) som oversettes til tekst via Windows OCR og brukes som prompt.",
+            );
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1063,7 +1117,9 @@ impl HfAssistantApp {
                     .on_hover_text("Tømmer samtalehistorikken og starter på nytt.")
                     .clicked()
                 {
-                    if self.is_generating {
+
+
+            if self.is_generating {
                         self.cancel_generation();
                     }
                     self.chat_history.clear();
@@ -1113,19 +1169,35 @@ impl HfAssistantApp {
         ui.separator();
 
         ui.horizontal(|ui| {
-            let right_reserve = if self.is_generating { 115.0 } else { 80.0 };
+            let mut right_reserve = if self.is_generating { 115.0 } else { 80.0 };
+            if self.enable_ocr_paste {
+                right_reserve += 165.0;
+            }
             let response = ui.add_sized(
-                [ui.available_width() - right_reserve, 32.0],
-                egui::TextEdit::singleline(&mut self.current_prompt)
+                [ui.available_width() - right_reserve, if self.current_prompt.contains('\n') { 70.0 } else { 34.0 }],
+                egui::TextEdit::multiline(&mut self.current_prompt)
                     .text_color(egui::Color32::WHITE)
-                    .hint_text("Skriv din prompt her og trykk Enter..."),
+                    .hint_text("Skriv din prompt her (eller lim inn bilde med OCR)..."),
             );
 
             if response.lost_focus()
-                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) && !i.modifiers.shift)
                 && !self.is_generating
             {
                 self.send_prompt();
+            }
+
+            if self.enable_ocr_paste {
+                if self.is_running_ocr {
+                    ui.spinner();
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80), "Kjører OCR...");
+                } else if ui
+                    .button(egui::RichText::new("📷 Lim inn bilde (OCR)").color(egui::Color32::WHITE))
+                    .on_hover_text("Lim inn bilde fra utklippstavlen (f.eks. skjermbilde fra Win+Shift+S). Teksten oversettes med Windows OCR og legges rett inn i prompten.")
+                    .clicked()
+                {
+                    self.start_clipboard_ocr();
+                }
             }
 
             if self.is_generating {
