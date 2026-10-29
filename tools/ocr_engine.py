@@ -1,23 +1,64 @@
 import os
 import sys
-import numpy as np
-from PIL import Image, ImageGrab
+import time
+
+# Begrens OpenBLAS og OMP til 1 tråd for å forhindre allokeringsfeil under Windows minnepress
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 # Tving UTF-8 standard output på Windows
-sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
+from PIL import Image, ImageGrab
 
 def grab_clipboard_to_files(dest_img_path, dest_thumb_raw):
     try:
-        clip = ImageGrab.grabclipboard()
+        # Prøv å hente bilde fra utklippstavlen (med opptil 4 korte forsøk i tilfelle Windows låser)
+        clip = None
+        for _ in range(4):
+            try:
+                clip = ImageGrab.grabclipboard()
+                if clip is not None:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.05)
+
         img = None
         if isinstance(clip, Image.Image):
             img = clip
         elif isinstance(clip, list):
             # Filkopiering i Windows Explorer (f.eks. Ctrl+C på bildefil)
             for f in clip:
-                if os.path.exists(f) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff')):
+                if isinstance(f, str) and os.path.exists(f) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff')):
                     img = Image.open(f)
                     break
+
+        # Fallback via Windows Forms Clipboard dersom PIL ikke fanget formatet direkte
+        if img is None:
+            try:
+                import subprocess
+                ps_script = f'''
+Add-Type -AssemblyName System.Windows.Forms
+if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
+    $img = [System.Windows.Forms.Clipboard]::GetImage()
+    $img.Save("{dest_img_path}", [System.Drawing.Imaging.ImageFormat]::Png)
+    Write-Output "OK_PS"
+}}
+'''
+                ps_out = subprocess.run(
+                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                    capture_output=True,
+                    text=True,
+                    timeout=3
+                )
+                if "OK_PS" in ps_out.stdout and os.path.exists(dest_img_path):
+                    img = Image.open(dest_img_path)
+            except Exception:
+                pass
 
         if img is None:
             sys.stderr.write("NO_IMAGE: Ingen bilde funnet i utklippstavlen.\n")
@@ -69,13 +110,14 @@ def run_ocr_on_file(image_path):
     elif img.mode != 'RGB':
         img = img.convert('RGB')
 
+    import numpy as np
     from rapidocr_onnxruntime import RapidOCR
+
     engine = RapidOCR()
     img_np = np.array(img)
     result, _ = engine(img_np)
 
     if not result:
-        # Ingen tekst gjenkjent
         return
 
     # Pakk ut polygon-koordinater og tekst
@@ -107,9 +149,6 @@ def run_ocr_on_file(image_path):
     # =========================================================================
     # REKONSTRUKSJON AV VISUELLE LINJER, BOKSER OG MELLOMROM MELLOM TALL
     # =========================================================================
-    # Grupper tekstbokser inn i samme horisontale linje dersom de overlapper vertikalt
-    # med mer enn 40 % av høyden. Dette sikrer at nettside-bokser, kolonner og tall
-    # på samme rad holdes sammen på samme linje!
     rows = []
     for b in sorted(boxes, key=lambda x: (x['top'], x['left'])):
         best_row = None
@@ -135,7 +174,6 @@ def run_ocr_on_file(image_path):
         else:
             rows.append([b])
 
-    # Sorter radene vertikalt ovenfra og ned
     rows.sort(key=lambda r: sum(b['top'] for b in r) / len(r))
 
     avg_height = sum(b['height'] for b in boxes) / len(boxes)
@@ -143,13 +181,11 @@ def run_ocr_on_file(image_path):
     last_row_bottom = None
 
     for r in rows:
-        # Sorter elementer i samme rad fra venstre mot høyre
         r.sort(key=lambda b: b['left'])
 
         r_top = min(b['top'] for b in r)
         r_bottom = max(b['bottom'] for b in r)
 
-        # Visuell avstand til forrige rad: dersom avstanden er markant (avsnitt / boks-skille)
         if last_row_bottom is not None:
             v_gap = r_top - last_row_bottom
             if v_gap > avg_height * 0.7:
@@ -157,7 +193,6 @@ def run_ocr_on_file(image_path):
 
         last_row_bottom = r_bottom
 
-        # Formater raden og bevar mellomrom mellom ord og tall
         row_str = ""
         last_item = None
 
@@ -175,7 +210,6 @@ def run_ocr_on_file(image_path):
                 prev_ends_digit = prev_text[-1].isdigit() if prev_text else False
                 cur_starts_digit = t[0].isdigit() if t else False
 
-                # Beregn naturlig mellomrom basert på pikselavstand
                 char_w = max(6.0, last_item['height'] * 0.45)
                 spaces_count = max(1, int(round(h_gap / char_w)))
 
@@ -186,7 +220,6 @@ def run_ocr_on_file(image_path):
                 else:
                     spacing = " "
 
-                # Sørg for at to tall aldri limes sammen uten mellomrom
                 if prev_ends_digit and cur_starts_digit:
                     if not spacing:
                         spacing = " "

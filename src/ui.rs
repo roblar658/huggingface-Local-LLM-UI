@@ -266,9 +266,10 @@ impl HfAssistantApp {
         self.next_image_id += 1;
         let tx = self.event_tx.clone();
 
-        let _ = std::fs::create_dir_all("cache");
-        let dest_png = PathBuf::from(format!("cache/img_{}.png", id));
-        let dest_thumb_raw = PathBuf::from(format!("cache/img_{}_thumb.raw", id));
+        let cache_dir = std::env::temp_dir().join("hf_assistant_cache");
+        let _ = std::fs::create_dir_all(&cache_dir);
+        let dest_png = cache_dir.join(format!("img_{}.png", id));
+        let dest_thumb_raw = cache_dir.join(format!("img_{}_thumb.raw", id));
 
         self.status_msg = format!("Henter bilde #{} fra utklippstavlen...", id);
 
@@ -1313,7 +1314,8 @@ impl HfAssistantApp {
                 if let Some(idx) = to_remove {
                     let removed = self.attached_images.remove(idx);
                     let _ = std::fs::remove_file(&removed.path);
-                    let thumb_raw = PathBuf::from(format!("cache/img_{}_thumb.raw", removed.id));
+                    let cache_dir = std::env::temp_dir().join("hf_assistant_cache");
+                    let thumb_raw = cache_dir.join(format!("img_{}_thumb.raw", removed.id));
                     let _ = std::fs::remove_file(thumb_raw);
                     self.status_msg = format!("Fjernet bilde #{}.", removed.id);
                 }

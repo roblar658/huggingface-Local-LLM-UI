@@ -11,10 +11,17 @@ impl OcrEngine {
         let mut candidates = vec![
             PathBuf::from("tools/ocr_engine.py"),
             PathBuf::from("tools\\ocr_engine.py"),
+            PathBuf::from("C:\\dev\\hf_local_assistant\\tools\\ocr_engine.py"),
         ];
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                candidates.push(parent.join("tools").join("ocr_engine.py"));
+            if let Some(p1) = exe.parent() {
+                candidates.push(p1.join("tools").join("ocr_engine.py"));
+                if let Some(p2) = p1.parent() {
+                    candidates.push(p2.join("tools").join("ocr_engine.py"));
+                    if let Some(p3) = p2.parent() {
+                        candidates.push(p3.join("tools").join("ocr_engine.py"));
+                    }
+                }
             }
         }
 
@@ -24,6 +31,16 @@ impl OcrEngine {
             }
         }
         None
+    }
+
+    fn execute_python(args: &[&std::ffi::OsStr]) -> Result<std::process::Output> {
+        if let Ok(out) = Command::new("python").args(args).output() {
+            return Ok(out);
+        }
+        if let Ok(out) = Command::new("py").args(args).output() {
+            return Ok(out);
+        }
+        Err(anyhow!("Kunne ikke starte hverken 'python' eller 'py'"))
     }
 
     fn get_native_tool_path() -> PathBuf {
@@ -52,13 +69,12 @@ impl OcrEngine {
             anyhow!("Fant ikke tools/ocr_engine.py for henting av utklippstavlebilde")
         })?;
 
-        let output = Command::new("python")
-            .arg(&script)
-            .arg("--grab-clipboard")
-            .arg(dest_png)
-            .arg(dest_thumb_raw)
-            .output()
-            .map_err(|e| anyhow!("Kunne ikke starte python for utklippstavle: {}", e))?;
+        let output = Self::execute_python(&[
+            script.as_os_str(),
+            std::ffi::OsStr::new("--grab-clipboard"),
+            dest_png.as_os_str(),
+            dest_thumb_raw.as_os_str(),
+        ])?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -113,7 +129,11 @@ impl OcrEngine {
     pub fn recognize_file(path: &Path) -> Result<String> {
         // 1. Prøv RapidOCR først
         if let Some(script) = Self::get_python_script_path() {
-            if let Ok(output) = Command::new("python").arg(&script).arg("--ocr").arg(path).output() {
+            if let Ok(output) = Self::execute_python(&[
+                script.as_os_str(),
+                std::ffi::OsStr::new("--ocr"),
+                path.as_os_str(),
+            ]) {
                 if output.status.success() {
                     let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if !text.is_empty() {
