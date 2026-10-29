@@ -97,11 +97,21 @@ cargo run --release
 cargo run --release -- --cli
 ```
 
+### Bygge Windows MSI-installasjonspakke
+For å bygge en frittstående Windows MSI-installasjonspakke (`HuggingFaceLocalAssistant.msi`):
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1
+```
+Installasjonspakken oppretter automatisk snarveier på skrivebordet og i Start-menyen, installerer applikasjonen og nødvendige biblioteker i `Program Files`, og gir en ren avinstallasjonsmulighet via Windows *Legg til eller fjern programmer*.
+
 ---
 
 ## Prosjektstruktur
 
 ```
+installer/
+  Package.wxs         WiX Toolset v4 definisjon for MSI-installasjonspakken
+  build_msi.ps1       Byggescript for release-kompilering og MSI-pakking
 src/
   main.rs             Inngangspunkt for applikasjonen (velger GUI eller CLI)
   ui.rs               Grafisk brukergrensesnitt implementert med egui/eframe

@@ -1,0 +1,78 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Hugging Face Local Assistant"
+           Manufacturer="Roblar"
+           Version="0.1.0"
+           UpgradeCode="9B24D982-F02A-4B29-873E-2A4B8F3C5912"
+           Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="En nyere versjon av Hugging Face Local Assistant er allerede installert." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Hugging Face Local Assistant">
+        <Directory Id="ToolsFolder" Name="tools" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Hugging Face Local Assistant" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="3A2197A1-4241-4E4A-8A47-1B90FE31C2D1">
+        <File Id="HfLocalAssistantExe" Source="..\target\release\hf_local_assistant.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="ApplicationProgramsFolder"
+                    Name="Hugging Face Local Assistant"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+          <Shortcut Id="DesktopShortcut"
+                    Directory="DesktopFolder"
+                    Name="Hugging Face Local Assistant"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Advertise="yes" />
+        </File>
+      </Component>
+
+      <Component Id="WinOcrExe" Guid="E641B2E3-6F47-497F-99F1-2B179428F102">
+        <File Id="WinOcrExeFile" Source="..\target\release\win_ocr.exe" KeyPath="yes" />
+      </Component>
+
+      <Component Id="LibStdCpp" Guid="7291B743-A3B1-4E87-8C1B-824EF6715B80">
+        <File Id="LibStdCppDll" Source="..\target\release\libstdc++-6.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="LibGcc" Guid="8C850E24-F423-4458-BB6A-23A53648B1E3">
+        <File Id="LibGccDll" Source="..\target\release\libgcc_s_seh-1.dll" KeyPath="yes" />
+      </Component>
+
+      <Component Id="LibWinPthread" Guid="C19519BC-25DE-4841-A89E-4BC3058D4DE4">
+        <File Id="LibWinPthreadDll" Source="..\target\release\libwinpthread-1.dll" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="ToolComponents" Directory="ToolsFolder">
+      <Component Id="OcrEnginePy" Guid="3E49E0F2-7212-4589-9A24-F8A389D6C024">
+        <File Id="OcrEnginePyFile" Source="..\tools\ocr_engine.py" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="ApplicationShortcut" Directory="ApplicationProgramsFolder" Guid="D206B1A8-7711-4089-9A34-FA543B7181F5">
+      <RemoveFolder Id="CleanUpShortCut" Directory="ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\Roblar\HfLocalAssistant" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="ProductFeature" Title="Hugging Face Local Assistant" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="ToolComponents" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+  </Package>
+</Wix>
+

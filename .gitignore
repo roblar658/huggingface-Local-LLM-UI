@@ -8,3 +8,7 @@ inspect_gguf*
 tools/**/obj/
 tools/**/bin/
 cache/
+*.msi
+*.wixobj
+*.wixpdb
+

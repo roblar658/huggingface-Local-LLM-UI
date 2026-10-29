@@ -179,13 +179,16 @@ impl HfAssistantApp {
     }
 
     fn refresh_local_models(&mut self) {
-        let models_dir = Path::new("models");
         let mut list = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(models_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    list.push(path);
+        for dir in crate::downloader::get_all_models_dirs() {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+                        if !list.contains(&path) {
+                            list.push(path);
+                        }
+                    }
                 }
             }
         }
@@ -233,14 +236,14 @@ impl HfAssistantApp {
         let repo_clone = repo_id.clone();
 
         self.tokio_handle.spawn(async move {
-            let models_dir = Path::new("models");
+            let models_dir = crate::downloader::get_default_models_dir();
             let tx_prog = tx.clone();
             let fname_for_prog = fname_clone.clone();
 
             let res = crate::downloader::download_hf_file_with_progress(
                 &repo_clone,
                 &fname_clone,
-                models_dir,
+                &models_dir,
                 move |downloaded, total| {
                     let _ = tx_prog.send(AppEvent::DownloadProgress {
                         filename: fname_for_prog.clone(),
@@ -252,7 +255,7 @@ impl HfAssistantApp {
             .await;
 
             // Smart nedlasting av tokenizer.json (sjekker både GGUF-depot og moder-depot)
-            let _ = crate::downloader::ensure_tokenizer_for_repo(&repo_clone, models_dir).await;
+            let _ = crate::downloader::ensure_tokenizer_for_repo(&repo_clone, &models_dir).await;
 
             match res {
                 Ok(path) => {
@@ -979,15 +982,10 @@ impl HfAssistantApp {
         );
         ui.separator();
 
-        let models_dir = Path::new("models");
-        let mut local_files = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(models_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("gguf") {
-                    local_files.push(p);
-                }
-            }
+        let mut local_files = self.downloaded_models.clone();
+        if local_files.is_empty() {
+            self.refresh_local_models();
+            local_files = self.downloaded_models.clone();
         }
 
         if local_files.is_empty() {
@@ -1221,12 +1219,12 @@ impl HfAssistantApp {
             );
 
             thread::spawn(move || {
-                let models_dir = Path::new("models");
+                let models_dir = p_clone.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| crate::downloader::get_default_models_dir());
                 // Sørg for at tokenizer.json er på plass før vi laster GGUF
                 let tok_res = handle.block_on(async {
                     crate::downloader::ensure_tokenizer_for_repo(
                         "ornith-ai/Ornith-1.5-9B",
-                        models_dir,
+                        &models_dir,
                     )
                     .await
                 });

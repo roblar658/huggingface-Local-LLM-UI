@@ -155,3 +155,63 @@ pub async fn ensure_tokenizer_for_repo(repo_id: &str, output_dir: &Path) -> Resu
 
     Err(anyhow!("Kunne ikke finne tokenizer.json i noen av kandidat-depotene for {}", repo_id))
 }
+
+/// Returnerer den foretrukne mappen for lagring av GGUF-modeller og tokenizere.
+/// Hvis programmet kjøres portabelt der `models/` er skrivbar, brukes den.
+/// Hvis programmet er installert i Program Files (skrivebeskyttet), brukes `%LOCALAPPDATA%\HuggingFaceLocalAssistant\models`.
+pub fn get_default_models_dir() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let exe_models = parent.join("models");
+            if exe_models.is_dir() {
+                let test_file = exe_models.join(".write_test");
+                if std::fs::write(&test_file, b"ok").is_ok() {
+                    let _ = std::fs::remove_file(test_file);
+                    return exe_models;
+                }
+            }
+        }
+    }
+
+    let local_models = PathBuf::from("models");
+    if local_models.is_dir() {
+        let test_file = local_models.join(".write_test");
+        if std::fs::write(&test_file, b"ok").is_ok() {
+            let _ = std::fs::remove_file(test_file);
+            return local_models;
+        }
+    }
+
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let app_dir = PathBuf::from(local_app_data).join("HuggingFaceLocalAssistant").join("models");
+        let _ = std::fs::create_dir_all(&app_dir);
+        return app_dir;
+    }
+
+    let _ = std::fs::create_dir_all(&local_models);
+    local_models
+}
+
+/// Henter alle mulige mapper hvor modeller kan befinne seg (både lokal mappe og AppData)
+pub fn get_all_models_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![get_default_models_dir()];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let d = parent.join("models");
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    let cur = PathBuf::from("models");
+    if !dirs.contains(&cur) {
+        dirs.push(cur);
+    }
+    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+        let app_dir = PathBuf::from(local_app_data).join("HuggingFaceLocalAssistant").join("models");
+        if !dirs.contains(&app_dir) {
+            dirs.push(app_dir);
+        }
+    }
+    dirs
+}
