@@ -48,7 +48,11 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
   - Dedikert fane for vurdering, justering og forhåndsgodkjenning av systeminstruksjoner (System Prompt).
   - Samtalepanel med høykontrast-tekst, justerbare inferensparametere og avbryt-funksjon.
   - Samtalekontekst med støtte for fler-stegs samtaler formatert kronologisk med `[bruker]` og `[AI]` adskilt med mellomrom, samt tilhørende tolkningsinstruks i System Prompt.
-  - Integrert optisk tegngjenkjenning (OCR): Valgfri mulighet for å lime inn bilder fra utklippstavlen (f.eks. skjermklipp via Win+Shift+S) eller bildefiler. Teksten analyseres med RapidOCR (PP-OCRv4 neural ONNX-modell med fallback til Windows Media OCR) med nøyaktig bevaring av visuelle linjeskift og avsnitt, og settes direkte inn i promptfeltet.
+  - **Avansert OCR og bildevedlegg i prompt**:
+    - Mulighet for å lime inn flere bilder direkte inn i promptfeltet (via utklippstavle med `Ctrl+V`, skjermklipp via `Win+Shift+S`, eller eksplisitt knapp).
+    - Hvert vedlagte bilde vises som et lite miniatyrbilde (thumbnail) med en `✕`-knapp for fjerning.
+    - Brukeren kan skrive inn ledetekst sammen med bildene.
+    - Ved sending kjøres OCR sekvensielt på bildene med RapidOCR (PP-OCRv4 neural ONNX-modell med fallback til Windows Media OCR). Tekstboks-gruppering rekonstruerer oppsett fra websider, kort, tabeller og kolonner, med korrekt bevaring av linjeskift, avsnitt og mellomrom mellom tall, og settes sammen til en helhetlig prompt for modellen.
   - Egen funksjon for øyeblikkelig nullstilling av samtalelogg (Reset chat).
 - **Kommandolinjegrensesnitt (CLI)**: Støtte for ren terminalbasert interaksjon via flagget `--cli` med støtte for samtalehistorikk og `reset`-kommando.
 
@@ -88,8 +92,11 @@ src/
   main.rs         Inngangspunkt for applikasjonen (velger GUI eller CLI)
   ui.rs           Grafisk brukergrensesnitt implementert med egui/eframe
   inference.rs    Egenutviklet inferensmotor (GGUF-parser, Win32 mmap, SIMD-kjerner, sampling)
+  ocr.rs          OCR-integrasjon og utklippstavlehåndtering
   hardware.rs     Maskinvaredeteksjon via Windows DXGI og systemkall
   hf_client.rs    Klient mot Hugging Face Hub API med hastighetsbegrensning
   recommender.rs  Beregning av minnebehov og maskinvarekompatibilitet
   downloader.rs   Håndtering av filnedlastinger og oppløsning av tokenizer
+tools/
+  ocr_engine.py   RapidOCR (PP-OCRv4 ONNX) layout- og linjeskiftrekonstruksjon
 ```

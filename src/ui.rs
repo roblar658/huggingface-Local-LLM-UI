@@ -32,7 +32,16 @@ pub enum AppEvent {
     InferenceFinished,
     InferenceCancelled,
     InferenceError(String),
-    OcrFinished(Result<String, String>),
+    CompositePromptReady(String),
+    ImagePasted(Result<(usize, PathBuf, PathBuf, usize, usize), String>),
+}
+
+pub struct AttachedImage {
+    pub id: usize,
+    pub path: PathBuf,
+    pub texture: Option<egui::TextureHandle>,
+    pub width: usize,
+    pub height: usize,
 }
 
 pub struct HfAssistantApp {
@@ -76,7 +85,9 @@ pub struct HfAssistantApp {
     max_tokens: usize,
     use_context: bool,
     enable_ocr_paste: bool,
-    is_running_ocr: bool,
+    attached_images: Vec<AttachedImage>,
+    next_image_id: usize,
+    is_pasting_image: bool,
     is_generating: bool,
     cancel_flag: Arc<AtomicBool>,
 }
@@ -124,7 +135,9 @@ impl HfAssistantApp {
             max_tokens: 250,
             use_context: true,
             enable_ocr_paste: true,
-            is_running_ocr: false,
+            attached_images: Vec::new(),
+            next_image_id: 1,
+            is_pasting_image: false,
             is_generating: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         };
@@ -244,17 +257,36 @@ impl HfAssistantApp {
         }
     }
 
-    fn start_clipboard_ocr(&mut self) {
-        if self.is_running_ocr {
+    fn paste_clipboard_image(&mut self, is_explicit: bool) {
+        if self.is_pasting_image {
             return;
         }
-        self.is_running_ocr = true;
-        self.status_msg =
-            "Leser bilde fra utklippstavlen og gjenkjenner tekst med Windows OCR...".to_string();
+        self.is_pasting_image = true;
+        let id = self.next_image_id;
+        self.next_image_id += 1;
         let tx = self.event_tx.clone();
+
+        let _ = std::fs::create_dir_all("cache");
+        let dest_png = PathBuf::from(format!("cache/img_{}.png", id));
+        let dest_thumb_raw = PathBuf::from(format!("cache/img_{}_thumb.raw", id));
+
+        self.status_msg = format!("Henter bilde #{} fra utklippstavlen...", id);
+
         thread::spawn(move || {
-            let res = crate::ocr::OcrEngine::recognize_clipboard();
-            let _ = tx.send(AppEvent::OcrFinished(res.map_err(|e| e.to_string())));
+            let res = crate::ocr::OcrEngine::grab_clipboard_image(&dest_png, &dest_thumb_raw);
+            match res {
+                Ok((w, h)) => {
+                    let _ = tx.send(AppEvent::ImagePasted(Ok((id, dest_png, dest_thumb_raw, w, h))));
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if !is_explicit && err_str.contains("NO_IMAGE") {
+                        let _ = tx.send(AppEvent::ImagePasted(Err(String::new())));
+                    } else {
+                        let _ = tx.send(AppEvent::ImagePasted(Err(err_str)));
+                    }
+                }
+            }
         });
     }
 
@@ -267,64 +299,119 @@ impl HfAssistantApp {
         }
 
         let prompt = self.current_prompt.trim().to_string();
-        if prompt.is_empty() || self.is_generating {
+        if prompt.is_empty() && self.attached_images.is_empty() {
+            return;
+        }
+        if self.is_generating {
             return;
         }
 
         self.cancel_flag.store(false, Ordering::SeqCst);
 
-        // Bygg prompt og system-prompt med eller uten kontekst
-        let (prompt_to_send, sys_to_send) = if self.use_context {
-            let mut parts: Vec<String> = Vec::new();
-            for (sender, text) in &self.chat_history {
-                let t = text.trim();
-                if t.is_empty() || t == "[Avbrutt av bruker]" || sender == "System" {
-                    continue;
-                }
-                if sender == "Du" {
-                    parts.push(format!("[bruker] {}", t));
-                } else if sender == "Modell" {
-                    parts.push(format!("[AI] {}", t));
-                }
-            }
-            parts.push(format!("[bruker] {}", prompt));
-            let full_prompt = parts.join(" ");
+        let images_to_process = std::mem::take(&mut self.attached_images);
+        let num_images = images_to_process.len();
 
-            let context_instruction = "Samtalehistorikk og kontekst er strukturert kronologisk der [bruker] angir meldinger fra brukeren og [AI] angir svar fra assistenten, adskilt med mellomrom. Tolk denne konteksten og svar som [AI] på den siste [bruker]-meldingen.";
-            let base_sys = self.system_prompt.trim();
-            let full_sys = if base_sys.is_empty() {
-                context_instruction.to_string()
+        let user_display_text = if num_images > 0 {
+            if prompt.is_empty() {
+                format!("[Kjører OCR på {} vedlagt(e) bilde(r)...]", num_images)
             } else {
-                format!("{} {}", base_sys, context_instruction)
-            };
-
-            (full_prompt, full_sys)
+                format!("{}\n\n[Kjører OCR på {} vedlagt(e) bilde(r)...]", prompt, num_images)
+            }
         } else {
-            (prompt.clone(), self.system_prompt.clone())
+            prompt.clone()
         };
 
-        self.chat_history.push(("Du".to_string(), prompt));
+        self.chat_history.push(("Du".to_string(), user_display_text));
         self.chat_history.push(("Modell".to_string(), String::new()));
         self.current_prompt.clear();
         self.is_generating = true;
-        self.status_msg = "Genererer svar...".to_string();
+        self.status_msg = if num_images > 0 {
+            format!("Gjenkjenner tekst fra {} bilde(r) med OCR...", num_images)
+        } else {
+            "Genererer svar...".to_string()
+        };
 
         let llm_arc = self.loaded_llm.clone();
         let tx = self.event_tx.clone();
         let max_toks = self.max_tokens;
         let temp = self.temperature as f64;
         let p = self.top_p as f64;
-        let sys_prompt = sys_to_send;
+        let base_system_prompt = self.system_prompt.trim().to_string();
         let disable_think = self.disable_thinking_tags;
         let cancel_arc = self.cancel_flag.clone();
+        let use_context = self.use_context;
+        let history_snapshot = self.chat_history.clone();
 
         thread::spawn(move || {
+            // 1. Kjør OCR på alle vedlagte bilder med linjeskift og mellomrom bevart
+            let mut composite_parts = Vec::new();
+            for (i, img) in images_to_process.iter().enumerate() {
+                if cancel_arc.load(Ordering::Relaxed) {
+                    let _ = tx.send(AppEvent::InferenceCancelled);
+                    return;
+                }
+                let ocr_res = crate::ocr::OcrEngine::recognize_file(&img.path);
+                let text = ocr_res.unwrap_or_default().trim().to_string();
+                if num_images > 1 {
+                    if text.is_empty() {
+                        composite_parts.push(format!("[Bilde {}]:\n(Ingen tekst gjenkjent)", i + 1));
+                    } else {
+                        composite_parts.push(format!("[Bilde {}]:\n{}", i + 1, text));
+                    }
+                } else if text.is_empty() {
+                    composite_parts.push("[Bilde]:\n(Ingen tekst gjenkjent)".to_string());
+                } else if prompt.is_empty() {
+                    composite_parts.push(text);
+                } else {
+                    composite_parts.push(format!("[Bilde]:\n{}", text));
+                }
+            }
+
+            if !prompt.is_empty() {
+                composite_parts.push(prompt.clone());
+            }
+
+            let final_prompt = composite_parts.join("\n\n");
+            let _ = tx.send(AppEvent::CompositePromptReady(final_prompt.clone()));
+
+            // 2. Bygg prompt og system-prompt med eller uten kontekst
+            let (prompt_to_send, sys_to_send) = if use_context {
+                let mut parts: Vec<String> = Vec::new();
+                let history_len = history_snapshot.len();
+                let prior = if history_len >= 2 { &history_snapshot[..history_len - 2] } else { &[] };
+                for (sender, text) in prior {
+                    let t = text.trim();
+                    if t.is_empty() || t == "[Avbrutt av bruker]" || sender == "System" {
+                        continue;
+                    }
+                    if sender == "Du" {
+                        parts.push(format!("[bruker] {}", t));
+                    } else if sender == "Modell" {
+                        parts.push(format!("[AI] {}", t));
+                    }
+                }
+                parts.push(format!("[bruker] {}", final_prompt));
+                let full_prompt = parts.join(" ");
+
+                let context_instruction = "Samtalehistorikk og kontekst er strukturert kronologisk der [bruker] angir meldinger fra brukeren og [AI] angir svar fra assistenten, adskilt med mellomrom. Tolk denne konteksten og svar som [AI] på den siste [bruker]-meldingen.";
+                let full_sys = if base_system_prompt.is_empty() {
+                    context_instruction.to_string()
+                } else {
+                    format!("{} {}", base_system_prompt, context_instruction)
+                };
+
+                (full_prompt, full_sys)
+            } else {
+                (final_prompt, base_system_prompt)
+            };
+
+            // 3. Utfør inferens
             let mut guard = llm_arc.lock().unwrap();
             if let Some(ref mut llm) = *guard {
                 let tx_token = tx.clone();
                 let cancel_for_cb = cancel_arc.clone();
                 let res = llm.generate_with_callback(
-                    &sys_prompt,
+                    &sys_to_send,
                     disable_think,
                     &prompt_to_send,
                     max_toks,
@@ -363,11 +450,14 @@ impl HfAssistantApp {
 
 impl eframe::App for HfAssistantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.enable_ocr_paste
-            && !self.is_running_ocr
-            && ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::V))
-        {
-            self.start_clipboard_ocr();
+        if self.enable_ocr_paste && !self.is_pasting_image {
+            let wants_paste = ctx.input(|i| {
+                (i.modifiers.ctrl && i.key_pressed(egui::Key::V))
+                    || (i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::V))
+            });
+            if wants_paste {
+                self.paste_clipboard_image(false);
+            }
         }
         if self.is_generating && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.cancel_generation();
@@ -488,25 +578,36 @@ impl eframe::App for HfAssistantApp {
                         text.push_str(&format!("\n[Feil: {}]", err));
                     }
                 }
-                AppEvent::OcrFinished(res) => {
-                    self.is_running_ocr = false;
+                AppEvent::CompositePromptReady(composite) => {
+                    let len = self.chat_history.len();
+                    if len >= 2 {
+                        self.chat_history[len - 2].1 = composite;
+                    }
+                    self.status_msg = "Genererer svar...".to_string();
+                }
+                AppEvent::ImagePasted(res) => {
+                    self.is_pasting_image = false;
                     match res {
-                        Ok(text) => {
-                            let trimmed = text.trim();
-                            if !trimmed.is_empty() {
-                                if self.current_prompt.is_empty() {
-                                    self.current_prompt = trimmed.to_string();
-                                } else {
-                                    self.current_prompt.push_str("\n\n");
-                                    self.current_prompt.push_str(trimmed);
-                                }
-                                self.status_msg =
-                                    "OCR fullført: Tekst med linjeskift fra bildet er limt inn i prompten."
-                                        .to_string();
-                            }
+                        Ok((id, png_path, thumb_path, w, h)) => {
+                            let texture = if let Ok((tw, th, pixels)) = crate::ocr::OcrEngine::load_thumbnail_raw(&thumb_path) {
+                                let color_img = egui::ColorImage::from_rgba_unmultiplied([tw, th], &pixels);
+                                Some(ctx.load_texture(format!("thumb_{}", id), color_img, Default::default()))
+                            } else {
+                                None
+                            };
+                            self.attached_images.push(AttachedImage {
+                                id,
+                                path: png_path,
+                                texture,
+                                width: w,
+                                height: h,
+                            });
+                            self.status_msg = format!("Bilde #{} lagt til (totalt {} bilde(r) vedlagt).", id, self.attached_images.len());
                         }
                         Err(err) => {
-                            self.status_msg = format!("OCR-feil: {}", err);
+                            if !err.is_empty() {
+                                self.status_msg = format!("Kunne ikke lime inn bilde: {}", err);
+                            }
                         }
                     }
                 }
@@ -1168,16 +1269,68 @@ impl HfAssistantApp {
 
         ui.separator();
 
+        if !self.attached_images.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    egui::RichText::new("📷 Vedlagte bilder:")
+                        .color(egui::Color32::from_rgb(120, 200, 255))
+                        .strong(),
+                );
+
+                let mut to_remove = None;
+                for (idx, img) in self.attached_images.iter().enumerate() {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(ref tex) = img.texture {
+                                ui.add(egui::Image::new(tex).max_size(egui::vec2(52.0, 52.0)));
+                            } else {
+                                ui.label("🖼️ Bilde");
+                            }
+
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("#{}", img.id))
+                                        .color(egui::Color32::WHITE)
+                                        .small(),
+                                );
+                                if ui
+                                    .button(
+                                        egui::RichText::new("✕")
+                                            .color(egui::Color32::from_rgb(255, 100, 100))
+                                            .strong(),
+                                    )
+                                    .on_hover_text("Fjern dette bildet")
+                                    .clicked()
+                                {
+                                    to_remove = Some(idx);
+                                }
+                            });
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+
+                if let Some(idx) = to_remove {
+                    let removed = self.attached_images.remove(idx);
+                    let _ = std::fs::remove_file(&removed.path);
+                    let thumb_raw = PathBuf::from(format!("cache/img_{}_thumb.raw", removed.id));
+                    let _ = std::fs::remove_file(thumb_raw);
+                    self.status_msg = format!("Fjernet bilde #{}.", removed.id);
+                }
+            });
+            ui.add_space(4.0);
+        }
+
         ui.horizontal(|ui| {
             let mut right_reserve = if self.is_generating { 115.0 } else { 80.0 };
             if self.enable_ocr_paste {
-                right_reserve += 165.0;
+                right_reserve += 175.0;
             }
             let response = ui.add_sized(
                 [ui.available_width() - right_reserve, if self.current_prompt.contains('\n') { 70.0 } else { 34.0 }],
                 egui::TextEdit::multiline(&mut self.current_prompt)
                     .text_color(egui::Color32::WHITE)
-                    .hint_text("Skriv din prompt her (eller lim inn bilde med OCR)..."),
+                    .hint_text("Skriv melding... (eller lim inn bilder med Ctrl+V)"),
             );
 
             if response.lost_focus()
@@ -1188,15 +1341,15 @@ impl HfAssistantApp {
             }
 
             if self.enable_ocr_paste {
-                if self.is_running_ocr {
+                if self.is_pasting_image {
                     ui.spinner();
-                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80), "Kjører OCR...");
+                    ui.colored_label(egui::Color32::from_rgb(255, 200, 80), "Limer inn...");
                 } else if ui
-                    .button(egui::RichText::new("📷 Lim inn bilde (OCR)").color(egui::Color32::WHITE))
-                    .on_hover_text("Lim inn bilde fra utklippstavlen (f.eks. skjermbilde fra Win+Shift+S). Teksten oversettes med Windows OCR og legges rett inn i prompten.")
+                    .button(egui::RichText::new("📷 Lim inn bilde (+)").color(egui::Color32::WHITE))
+                    .on_hover_text("Lim inn bilde fra utklippstavlen (Win+Shift+S eller kopi). Du kan legge til flere bilder!")
                     .clicked()
                 {
-                    self.start_clipboard_ocr();
+                    self.paste_clipboard_image(true);
                 }
             }
 

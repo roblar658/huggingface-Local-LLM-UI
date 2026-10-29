@@ -6,33 +6,61 @@ from PIL import Image, ImageGrab
 # Tving UTF-8 standard output på Windows
 sys.stdout.reconfigure(encoding='utf-8')
 
-def get_image():
-    # 1. Sjekk argument (filbane)
-    if len(sys.argv) > 1 and os.path.exists(sys.argv[1]):
-        try:
-            return Image.open(sys.argv[1])
-        except Exception as e:
-            sys.stderr.write(f"FEIL_FIL: Kunne ikke åpne bildefilen: {e}\n")
-            sys.exit(2)
-
-    # 2. Sjekk utklippstavle
+def grab_clipboard_to_files(dest_img_path, dest_thumb_raw):
     try:
         clip = ImageGrab.grabclipboard()
+        img = None
         if isinstance(clip, Image.Image):
-            return clip
+            img = clip
         elif isinstance(clip, list):
-            # Filkopiering i Windows Explorer
+            # Filkopiering i Windows Explorer (f.eks. Ctrl+C på bildefil)
             for f in clip:
                 if os.path.exists(f) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff')):
-                    return Image.open(f)
-    except Exception:
-        pass
+                    img = Image.open(f)
+                    break
 
-    sys.stderr.write("INGEN_BILDE: Fant ikke bilde i utklippstavlen. Ta et skjermbilde (f.eks. med Win+Shift+S) først.\n")
-    sys.exit(2)
+        if img is None:
+            sys.stderr.write("NO_IMAGE: Ingen bilde funnet i utklippstavlen.\n")
+            sys.exit(2)
 
-def run_ocr(img):
-    # Konverter RGBA til RGB med hvit bakgrunn for optimal kontrast
+        # Lagre fullversjon som PNG
+        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+            alpha = img.convert('RGBA')
+            bg = Image.new('RGBA', alpha.size, (255, 255, 255, 255))
+            bg.paste(alpha, mask=alpha)
+            rgb_img = bg.convert('RGB')
+        else:
+            rgb_img = img.convert('RGB')
+
+        rgb_img.save(dest_img_path, "PNG")
+
+        # Lag thumbnail for egui UI
+        thumb = img.convert('RGBA')
+        thumb.thumbnail((80, 80), Image.Resampling.LANCZOS)
+        w, h = thumb.size
+
+        with open(dest_thumb_raw, "wb") as f:
+            header = f"{w},{h}\n".encode('ascii')
+            f.write(header)
+            f.write(thumb.tobytes())
+
+        print(f"OK {w} {h}")
+        sys.exit(0)
+    except Exception as e:
+        sys.stderr.write(f"ERROR: {e}\n")
+        sys.exit(1)
+
+def run_ocr_on_file(image_path):
+    if not os.path.exists(image_path):
+        sys.stderr.write(f"FILE_NOT_FOUND: {image_path}\n")
+        sys.exit(2)
+
+    try:
+        img = Image.open(image_path)
+    except Exception as e:
+        sys.stderr.write(f"CANNOT_OPEN: {e}\n")
+        sys.exit(2)
+
     if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
         alpha = img.convert('RGBA')
         bg = Image.new('RGBA', alpha.size, (255, 255, 255, 255))
@@ -47,61 +75,138 @@ def run_ocr(img):
     result, _ = engine(img_np)
 
     if not result:
-        sys.stderr.write("TOM_TEKST: Bildet ble analysert, men ingen tekst ble gjenkjent.\n")
-        sys.exit(4)
+        # Ingen tekst gjenkjent
+        return
 
-    # Bevar visuelle linjeskift og avsnitt basert på koordinater (bounding boxes)
-    lines_with_boxes = []
+    # Pakk ut polygon-koordinater og tekst
+    boxes = []
     for item in result:
         bbox, text, score = item
         text = text.strip()
         if not text:
             continue
-        # bbox er [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
         ys = [p[1] for p in bbox]
         xs = [p[0] for p in bbox]
         top = min(ys)
         bottom = max(ys)
         left = min(xs)
+        right = max(xs)
         height = max(1.0, bottom - top)
-        lines_with_boxes.append({
+        boxes.append({
             'top': top,
             'bottom': bottom,
             'left': left,
+            'right': right,
             'height': height,
             'text': text
         })
 
-    if not lines_with_boxes:
-        sys.stderr.write("TOM_TEKST: Ingen gyldig tekst funnet.\n")
-        sys.exit(4)
+    if not boxes:
+        return
 
-    # Sorter linjene ovenfra og ned
-    lines_with_boxes.sort(key=lambda item: (item['top'], item['left']))
+    # =========================================================================
+    # REKONSTRUKSJON AV VISUELLE LINJER, BOKSER OG MELLOMROM MELLOM TALL
+    # =========================================================================
+    # Grupper tekstbokser inn i samme horisontale linje dersom de overlapper vertikalt
+    # med mer enn 40 % av høyden. Dette sikrer at nettside-bokser, kolonner og tall
+    # på samme rad holdes sammen på samme linje!
+    rows = []
+    for b in sorted(boxes, key=lambda x: (x['top'], x['left'])):
+        best_row = None
+        best_overlap = 0.0
 
-    # Beregn gjennomsnittlig linjehøyde for å skille vanlige linjeskift fra avsnitt
-    avg_height = sum(l['height'] for l in lines_with_boxes) / len(lines_with_boxes)
+        for r in rows:
+            r_top = min(item['top'] for item in r)
+            r_bottom = max(item['bottom'] for item in r)
+            r_height = r_bottom - r_top
 
-    formatted_lines = []
-    last_bottom = None
+            overlap_top = max(b['top'], r_top)
+            overlap_bottom = min(b['bottom'], r_bottom)
+            overlap = max(0.0, overlap_bottom - overlap_top)
 
-    for item in lines_with_boxes:
-        cur_top = item['top']
-        cur_bottom = item['bottom']
-        text = item['text']
+            min_h = min(b['height'], r_height)
+            if min_h > 0 and (overlap / min_h) > 0.4:
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_row = r
 
-        if last_bottom is not None:
-            gap = cur_top - last_bottom
-            # Avsnittshopp dersom vertikalt gap er større enn 0.6x gjennomsnittlig linjehøyde
-            if gap > avg_height * 0.6:
-                formatted_lines.append("")
+        if best_row is not None:
+            best_row.append(b)
+        else:
+            rows.append([b])
 
-        formatted_lines.append(text)
-        last_bottom = cur_bottom
+    # Sorter radene vertikalt ovenfra og ned
+    rows.sort(key=lambda r: sum(b['top'] for b in r) / len(r))
 
-    output_text = "\n".join(formatted_lines).strip()
-    print(output_text)
+    avg_height = sum(b['height'] for b in boxes) / len(boxes)
+    formatted_rows = []
+    last_row_bottom = None
+
+    for r in rows:
+        # Sorter elementer i samme rad fra venstre mot høyre
+        r.sort(key=lambda b: b['left'])
+
+        r_top = min(b['top'] for b in r)
+        r_bottom = max(b['bottom'] for b in r)
+
+        # Visuell avstand til forrige rad: dersom avstanden er markant (avsnitt / boks-skille)
+        if last_row_bottom is not None:
+            v_gap = r_top - last_row_bottom
+            if v_gap > avg_height * 0.7:
+                formatted_rows.append("")
+
+        last_row_bottom = r_bottom
+
+        # Formater raden og bevar mellomrom mellom ord og tall
+        row_str = ""
+        last_item = None
+
+        for b in r:
+            t = b['text'].strip()
+            if not t:
+                continue
+
+            if last_item is None:
+                row_str = t
+            else:
+                h_gap = max(0.0, b['left'] - last_item['right'])
+                prev_text = last_item['text'].strip()
+
+                prev_ends_digit = prev_text[-1].isdigit() if prev_text else False
+                cur_starts_digit = t[0].isdigit() if t else False
+
+                # Beregn naturlig mellomrom basert på pikselavstand
+                char_w = max(6.0, last_item['height'] * 0.45)
+                spaces_count = max(1, int(round(h_gap / char_w)))
+
+                if spaces_count >= 4:
+                    spacing = "    "
+                elif spaces_count > 1:
+                    spacing = " " * spaces_count
+                else:
+                    spacing = " "
+
+                # Sørg for at to tall aldri limes sammen uten mellomrom
+                if prev_ends_digit and cur_starts_digit:
+                    if not spacing:
+                        spacing = " "
+
+                row_str += spacing + t
+
+            last_item = b
+
+        if row_str:
+            formatted_rows.append(row_str)
+
+    output = "\n".join(formatted_rows).strip()
+    print(output)
 
 if __name__ == '__main__':
-    img = get_image()
-    run_ocr(img)
+    if len(sys.argv) >= 4 and sys.argv[1] == '--grab-clipboard':
+        grab_clipboard_to_files(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) >= 2:
+        img_path = sys.argv[2] if sys.argv[1] == '--ocr' and len(sys.argv) >= 3 else sys.argv[1]
+        run_ocr_on_file(img_path)
+    else:
+        sys.stderr.write("Bruk: ocr_engine.py --grab-clipboard <dest_img> <dest_thumb> | --ocr <image_path>\n")
+        sys.exit(1)
