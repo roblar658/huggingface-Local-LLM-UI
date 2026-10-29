@@ -2,6 +2,12 @@
 
 En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GGUF-språkmodeller med en egenutviklet inferensmotor, minnekartlegging og SIMD-optimaliserte kvantiseringskjerner.
 
+<img width="833" height="539" alt="image" src="https://github.com/user-attachments/assets/358cd437-1927-45d1-afdc-f8a607513aaf" />
+<img width="833" height="536" alt="image" src="https://github.com/user-attachments/assets/515dd373-1091-44ba-ad74-f93c82161eeb" />
+<img width="830" height="542" alt="image" src="https://github.com/user-attachments/assets/5bb31cd5-91e7-4165-b13c-8e5ae044214c" />
+<img width="832" height="539" alt="image" src="https://github.com/user-attachments/assets/fac642ad-5dfc-4023-a933-986a6bd688be" />
+
+
 ---
 
 ## Oversikt
