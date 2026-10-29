@@ -149,7 +149,7 @@ fn run_cli() -> Result<()> {
                 sys_prompt,
                 true,
                 &full_prompt,
-                200,
+                500,
                 0.7,
                 0.9,
                 None,

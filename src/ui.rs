@@ -132,7 +132,7 @@ impl HfAssistantApp {
             current_prompt: String::new(),
             temperature: 0.7,
             top_p: 0.9,
-            max_tokens: 250,
+            max_tokens: 500,
             use_context: true,
             enable_ocr_paste: true,
             attached_images: Vec::new(),
@@ -1197,7 +1197,7 @@ impl HfAssistantApp {
             ui.colored_label(egui::Color32::WHITE, "Temperatur:");
             ui.add(egui::Slider::new(&mut self.temperature, 0.1..=1.5));
             ui.colored_label(egui::Color32::WHITE, "Max Tokens:");
-            ui.add(egui::Slider::new(&mut self.max_tokens, 50..=1000));
+            ui.add(egui::Slider::new(&mut self.max_tokens, 50..=2000));
             ui.checkbox(
                 &mut self.use_context,
                 egui::RichText::new("Bruk kontekst").color(egui::Color32::WHITE),
