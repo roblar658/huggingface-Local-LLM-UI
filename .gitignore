@@ -2,5 +2,6 @@
 /models/
 *.gguf
 *.exe
+*.dll
 *.pdb
 inspect_gguf*
