@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 
@@ -12,11 +13,11 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-from PIL import Image, ImageGrab
+from PIL import Image, ImageGrab, ImageOps
+
 
 def grab_clipboard_to_files(dest_img_path, dest_thumb_raw):
     try:
-        # Prøv å hente bilde fra utklippstavlen (med opptil 4 korte forsøk i tilfelle Windows låser)
         clip = None
         for _ in range(4):
             try:
@@ -31,16 +32,21 @@ def grab_clipboard_to_files(dest_img_path, dest_thumb_raw):
         if isinstance(clip, Image.Image):
             img = clip
         elif isinstance(clip, list):
-            # Filkopiering i Windows Explorer (f.eks. Ctrl+C på bildefil)
             for f in clip:
-                if isinstance(f, str) and os.path.exists(f) and f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff')):
+                if (
+                    isinstance(f, str)
+                    and os.path.exists(f)
+                    and f.lower().endswith(
+                        ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff')
+                    )
+                ):
                     img = Image.open(f)
                     break
 
-        # Fallback via Windows Forms Clipboard dersom PIL ikke fanget formatet direkte
         if img is None:
             try:
                 import subprocess
+
                 ps_script = f'''
 Add-Type -AssemblyName System.Windows.Forms
 if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
@@ -50,10 +56,16 @@ if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
 }}
 '''
                 ps_out = subprocess.run(
-                    ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-Command",
+                        ps_script,
+                    ],
                     capture_output=True,
                     text=True,
-                    timeout=3
+                    timeout=3,
                 )
                 if "OK_PS" in ps_out.stdout and os.path.exists(dest_img_path):
                     img = Image.open(dest_img_path)
@@ -64,8 +76,9 @@ if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
             sys.stderr.write("NO_IMAGE: Ingen bilde funnet i utklippstavlen.\n")
             sys.exit(2)
 
-        # Lagre fullversjon som PNG
-        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+        if img.mode in ('RGBA', 'LA') or (
+            img.mode == 'P' and 'transparency' in img.info
+        ):
             alpha = img.convert('RGBA')
             bg = Image.new('RGBA', alpha.size, (255, 255, 255, 255))
             bg.paste(alpha, mask=alpha)
@@ -75,7 +88,6 @@ if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
 
         rgb_img.save(dest_img_path, "PNG")
 
-        # Lag thumbnail for egui UI
         thumb = img.convert('RGBA')
         thumb.thumbnail((80, 80), Image.Resampling.LANCZOS)
         w, h = thumb.size
@@ -91,6 +103,105 @@ if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{
         sys.stderr.write(f"ERROR: {e}\n")
         sys.exit(1)
 
+
+def _normalize_homoglyph_num(tok: str) -> str:
+    out = []
+    for ch in tok:
+        if ch in ('i', 'I', 'l', '|'):
+            out.append('1')
+        elif ch in ('o', 'O'):
+            out.append('0')
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def fix_ocr_numeric_traps(text: str) -> str:
+    """
+    Korrigerer typiske OCR-feiltolkninger og font-feller (f.eks. Georgia old-style tall
+    i programmeringskonkurranser som Kattis/Codeforces der '100' har x-høyde som 'ioo'/'1oo'/'i00',
+    eller '1' tolkes som 'l'/'i'/'I').
+    """
+    # 1. Utbedre avkuttet "l be between" -> "will be between"
+    text = re.sub(r'(?i)\bl\s+be\s+between\b', 'will be between', text)
+
+    # 2. Tierpotenser og tall med old-style '1'/'0'-homoglyfer: ioo, i00, 1oo, l00, I00, iooo -> 100, 1000
+    def _replace_pow10(m):
+        return '1' + ('0' * len(m.group(2)))
+
+    text = re.sub(r'\b([1iIl])([0oO]{2,10})\b', _replace_pow10, text)
+    text = re.sub(r'\b([iIl])(0{1,10})\b', _replace_pow10, text)
+
+    # 3. Sifre etterfulgt av 'o'/'O' (f.eks. 1o -> 10, 5o -> 50, 10o -> 100)
+    text = re.sub(
+        r'\b(\d+)([oO]+)\b', lambda m: m.group(1) + ('0' * len(m.group(2))), text
+    )
+
+    # 4. 'o'/'O' etterfulgt av sifre (f.eks. o5 -> 05)
+    text = re.sub(
+        r'\b([oO]+)(\d+)\b', lambda m: ('0' * len(m.group(1))) + m.group(2), text
+    )
+
+    # 5. Intervall-uttrykk: "between X and Y" / "from X to Y" / "mellom X og Y"
+    def _fix_range(m):
+        w1, a, w2, b = m.group(1), m.group(2), m.group(3), m.group(4)
+        # Hvis minst ett av leddene ser ut som et tall eller homoglyf-tall, normaliser begge
+        a_norm = _normalize_homoglyph_num(a)
+        b_norm = _normalize_homoglyph_num(b)
+        if a_norm.isdigit() and b_norm.isdigit():
+            return f"{w1} {a_norm} {w2} {b_norm}"
+        return m.group(0)
+
+    text = re.sub(
+        r'(?i)\b(between|from|mellom|fra)\s+([0-9iIl|oO]+)\s+(and|to|og|til)\s+([0-9iIl|oO]+)\b',
+        _fix_range,
+        text,
+    )
+
+    # 6. Ulikheter: "l <= C" eller "A <= ioo"
+    text = re.sub(
+        r'\b([1iIl][0oO]*)\b(?=\s*[≤≥<>])',
+        lambda m: _normalize_homoglyph_num(m.group(1)),
+        text,
+    )
+    text = re.sub(
+        r'(?<=[≤≥<>])\s*\b([1iIl][0oO]+|l)\b',
+        lambda m: " " + _normalize_homoglyph_num(m.group(1)),
+        text,
+    )
+
+    return text
+
+
+def extract_boxes_from_rapidocr(result, scale=1.0, border=0.0):
+    boxes = []
+    if not result:
+        return boxes
+    for item in result:
+        bbox, text, score = item
+        text = text.strip()
+        if not text:
+            continue
+        ys = [(p[1] / scale) - border for p in bbox]
+        xs = [(p[0] / scale) - border for p in bbox]
+        top = min(ys)
+        bottom = max(ys)
+        left = min(xs)
+        right = max(xs)
+        height = max(1.0, bottom - top)
+        boxes.append(
+            {
+                'top': top,
+                'bottom': bottom,
+                'left': left,
+                'right': right,
+                'height': height,
+                'text': text,
+            }
+        )
+    return boxes
+
+
 def run_ocr_on_file(image_path):
     if not os.path.exists(image_path):
         sys.stderr.write(f"FILE_NOT_FOUND: {image_path}\n")
@@ -102,7 +213,9 @@ def run_ocr_on_file(image_path):
         sys.stderr.write(f"CANNOT_OPEN: {e}\n")
         sys.exit(2)
 
-    if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+    if img.mode in ('RGBA', 'LA') or (
+        img.mode == 'P' and 'transparency' in img.info
+    ):
         alpha = img.convert('RGBA')
         bg = Image.new('RGBA', alpha.size, (255, 255, 255, 255))
         bg.paste(alpha, mask=alpha)
@@ -115,33 +228,52 @@ def run_ocr_on_file(image_path):
 
     engine = RapidOCR()
     img_np = np.array(img)
-    result, _ = engine(img_np)
+    # Deaktiver 180-graders vinkelklassifiserer (use_cls=False) slik at horisontale tekstlinjer
+    # med kursive variabler (A, B, C) aldri snus opp-ned ved en feil!
+    result_1x, _ = engine(img_np, use_cls=False)
+    boxes = extract_boxes_from_rapidocr(result_1x, scale=1.0, border=0.0)
 
-    if not result:
-        return
+    # Sjekk om det finnes mistenkelige vertikale hull (f.eks. der en linje med skråstilte
+    # matematiske symboler som 'B' ble hoppet over av DBNet ved 1x oppløsning).
+    # Ved behov kjører vi et 2x oppskalert pass med use_cls=False og fletter inn manglende linjer!
+    need_2x_pass = not boxes
+    if len(boxes) >= 2:
+        sorted_b = sorted(boxes, key=lambda b: b['top'])
+        avg_h = sum(b['height'] for b in sorted_b) / len(sorted_b)
+        for i in range(len(sorted_b) - 1):
+            gap = sorted_b[i + 1]['top'] - sorted_b[i]['bottom']
+            if gap > avg_h * 0.85:
+                need_2x_pass = True
+                break
 
-    # Pakk ut polygon-koordinater og tekst
-    boxes = []
-    for item in result:
-        bbox, text, score = item
-        text = text.strip()
-        if not text:
-            continue
-        ys = [p[1] for p in bbox]
-        xs = [p[0] for p in bbox]
-        top = min(ys)
-        bottom = max(ys)
-        left = min(xs)
-        right = max(xs)
-        height = max(1.0, bottom - top)
-        boxes.append({
-            'top': top,
-            'bottom': bottom,
-            'left': left,
-            'right': right,
-            'height': height,
-            'text': text
-        })
+    if need_2x_pass:
+        border_px = 24
+        img_pad = ImageOps.expand(img, border=border_px, fill='white')
+        img_2x = img_pad.resize(
+            (img_pad.width * 2, img_pad.height * 2), Image.Resampling.BICUBIC
+        )
+        result_2x, _ = engine(
+            np.array(img_2x),
+            use_cls=False,
+            box_thresh=0.3,
+            unclip_ratio=1.8,
+        )
+        boxes_2x = extract_boxes_from_rapidocr(
+            result_2x, scale=2.0, border=float(border_px)
+        )
+        # Flett inn bokser fra 2x-passet som ikke allerede overlapper med en boks i 1x-passet
+        for b2 in boxes_2x:
+            overlaps_existing = False
+            for b1 in boxes:
+                ov_top = max(b1['top'], b2['top'])
+                ov_bot = min(b1['bottom'], b2['bottom'])
+                ov_h = max(0.0, ov_bot - ov_top)
+                min_h = min(b1['height'], b2['height'])
+                if min_h > 0 and (ov_h / min_h) > 0.35:
+                    overlaps_existing = True
+                    break
+            if not overlaps_existing:
+                boxes.append(b2)
 
     if not boxes:
         return
@@ -232,14 +364,22 @@ def run_ocr_on_file(image_path):
             formatted_rows.append(row_str)
 
     output = "\n".join(formatted_rows).strip()
+    output = fix_ocr_numeric_traps(output)
     print(output)
+
 
 if __name__ == '__main__':
     if len(sys.argv) >= 4 and sys.argv[1] == '--grab-clipboard':
         grab_clipboard_to_files(sys.argv[2], sys.argv[3])
     elif len(sys.argv) >= 2:
-        img_path = sys.argv[2] if sys.argv[1] == '--ocr' and len(sys.argv) >= 3 else sys.argv[1]
+        img_path = (
+            sys.argv[2]
+            if sys.argv[1] == '--ocr' and len(sys.argv) >= 3
+            else sys.argv[1]
+        )
         run_ocr_on_file(img_path)
     else:
-        sys.stderr.write("Bruk: ocr_engine.py --grab-clipboard <dest_img> <dest_thumb> | --ocr <image_path>\n")
+        sys.stderr.write(
+            "Bruk: ocr_engine.py --grab-clipboard <dest_img> <dest_thumb> | --ocr <image_path>\n"
+        )
         sys.exit(1)
