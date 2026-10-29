@@ -2,9 +2,9 @@
 
 En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GGUF-språkmodeller med en egenutviklet GPU- og CPU-inferensmotor (CUDA Driver API PTX-kjerner og AVX2/FMA SIMD), minnekartlegging og dynamisk ressursstyring.
 
-<img width="833" height="539" alt="image" src="https://github.com/user-attachments/assets/358cd437-1927-45d1-afdc-f8a607513aaf" />
-<img width="833" height="536" alt="image" src="https://github.com/user-attachments/assets/515dd373-1091-44ba-ad74-f93c82161eeb" />
-<img width="956" height="514" alt="image" src="https://github.com/user-attachments/assets/b71f2a8a-56ec-47e6-b27d-08c534be350d" />
+<img width="957" height="545" alt="image" src="https://github.com/user-attachments/assets/921df855-9dfc-40ee-9b9a-735c6f3c4573" />
+<img width="956" height="536" alt="image" src="https://github.com/user-attachments/assets/8ceb6532-02de-437f-a3f5-a36627cdbdc6" />
+<img width="957" height="526" alt="image" src="https://github.com/user-attachments/assets/d9086947-ecf9-47a9-bc20-bcd3083200a7" />
 <img width="959" height="539" alt="image" src="https://github.com/user-attachments/assets/b4eb4f28-3999-4c4c-8e9e-17a18a5c2453" />
 
 
