@@ -459,7 +459,7 @@ impl GgufModelFile {
             .ok_or_else(|| anyhow!("Mangler flyttalls-metadata '{}' i GGUF", key))
     }
 
-    pub fn tensor(&self, name: &str) -> Result<MmapWeight> {
+    pub fn tensor_no_gpu(&self, name: &str) -> Result<MmapWeight> {
         let desc = self
             .tensors
             .get(name)
@@ -470,11 +470,30 @@ impl GgufModelFile {
             dtype: desc.dtype,
             abs_offset: desc.abs_offset,
             byte_len: desc.byte_len,
+            gpu_buf: None,
+        })
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<MmapWeight> {
+        let desc = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| anyhow!("Fant ikke tensor '{}' i GGUF", name))?;
+        let slice = &self.mmap.as_slice()[desc.abs_offset..desc.abs_offset + desc.byte_len];
+        let gpu_buf = crate::gpu::CudaEngine::global()
+            .and_then(|cuda| cuda.try_upload_weight(slice, desc.dtype));
+        Ok(MmapWeight {
+            mmap: self.mmap.clone(),
+            dims: desc.dims.clone(),
+            dtype: desc.dtype,
+            abs_offset: desc.abs_offset,
+            byte_len: desc.byte_len,
+            gpu_buf,
         })
     }
 
     pub fn tensor_f32_1d(&self, name: &str) -> Result<Vec<f32>> {
-        let w = self.tensor(name)?;
+        let w = self.tensor_no_gpu(name)?;
         let elem_count: usize = w.dims.iter().product();
         let mut out = vec![0.0f32; elem_count];
         dequantize_slice(w.bytes(), w.dtype, &mut out)?;
@@ -482,7 +501,7 @@ impl GgufModelFile {
     }
 
     pub fn tensor_f32_flat(&self, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
-        let w = self.tensor(name)?;
+        let w = self.tensor_no_gpu(name)?;
         let elem_count: usize = w.dims.iter().product();
         let mut out = vec![0.0f32; elem_count];
         dequantize_slice(w.bytes(), w.dtype, &mut out)?;
@@ -490,8 +509,8 @@ impl GgufModelFile {
     }
 }
 
-/// Zero-copy vektmatrise knyttet direkte til den minnekartlagte GGUF-filen (`MapViewOfFile`).
-/// Krever 0 bytes ekstra RAM og 0 fil-lesinger under generering.
+/// Zero-copy vektmatrise knyttet direkte til den minnekartlagte GGUF-filen (`MapViewOfFile`)
+/// med valgfri direkte GPU VRAM-akselerasjon via CUDA PTX (`CudaWeightBuffer`).
 #[derive(Clone)]
 pub struct MmapWeight {
     mmap: Arc<MmapFile>,
@@ -499,6 +518,7 @@ pub struct MmapWeight {
     pub dtype: GgmlDType,
     abs_offset: usize,
     byte_len: usize,
+    pub gpu_buf: Option<Arc<crate::gpu::CudaWeightBuffer>>,
 }
 
 impl MmapWeight {
@@ -530,6 +550,14 @@ impl MmapWeight {
                 w_k
             );
         }
+        if let Some(ref gpu_buf) = self.gpu_buf {
+            if let Some(cuda) = crate::gpu::CudaEngine::global() {
+                if let Some(gpu_out) = cuda.matmul_batched(gpu_buf, x, m, n, k) {
+                    return Ok(gpu_out);
+                }
+            }
+        }
+
         let w_bytes = self.bytes();
         let row_bytes = (k / self.dtype.block_size()) * self.dtype.type_size();
 
@@ -682,6 +710,106 @@ impl MmapWeight {
         }
 
         Ok(out)
+    }
+
+    pub fn matmul_triple_same_input(
+        w1: &Self,
+        w2: &Self,
+        w3: &Self,
+        x: &[f32],
+        m: usize,
+        k: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if let (Some(ref b1), Some(ref b2), Some(ref b3)) = (&w1.gpu_buf, &w2.gpu_buf, &w3.gpu_buf)
+        {
+            if let Some(cuda) = crate::gpu::CudaEngine::global() {
+                let targets = [
+                    (b1.as_ref(), w1.dims[0]),
+                    (b2.as_ref(), w2.dims[0]),
+                    (b3.as_ref(), w3.dims[0]),
+                ];
+                if let Some(mut res) = cuda.matmul_group_same_input(&targets, x, m, k) {
+                    if res.len() == 3 {
+                        let r3 = res.pop().unwrap();
+                        let r2 = res.pop().unwrap();
+                        let r1 = res.pop().unwrap();
+                        return Ok((r1, r2, r3));
+                    }
+                }
+            }
+        }
+        Ok((
+            w1.matmul_batched(x, m, k)?,
+            w2.matmul_batched(x, m, k)?,
+            w3.matmul_batched(x, m, k)?,
+        ))
+    }
+
+    pub fn matmul_quad_same_input(
+        w1: &Self,
+        w2: &Self,
+        w3: &Self,
+        w4: &Self,
+        x: &[f32],
+        m: usize,
+        k: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        if let (Some(ref b1), Some(ref b2), Some(ref b3), Some(ref b4)) =
+            (&w1.gpu_buf, &w2.gpu_buf, &w3.gpu_buf, &w4.gpu_buf)
+        {
+            if let Some(cuda) = crate::gpu::CudaEngine::global() {
+                let targets = [
+                    (b1.as_ref(), w1.dims[0]),
+                    (b2.as_ref(), w2.dims[0]),
+                    (b3.as_ref(), w3.dims[0]),
+                    (b4.as_ref(), w4.dims[0]),
+                ];
+                if let Some(mut res) = cuda.matmul_group_same_input(&targets, x, m, k) {
+                    if res.len() == 4 {
+                        let r4 = res.pop().unwrap();
+                        let r3 = res.pop().unwrap();
+                        let r2 = res.pop().unwrap();
+                        let r1 = res.pop().unwrap();
+                        return Ok((r1, r2, r3, r4));
+                    }
+                }
+            }
+        }
+        Ok((
+            w1.matmul_batched(x, m, k)?,
+            w2.matmul_batched(x, m, k)?,
+            w3.matmul_batched(x, m, k)?,
+            w4.matmul_batched(x, m, k)?,
+        ))
+    }
+
+    pub fn ffn_swiglu_batched(
+        w_gate: &Self,
+        w_up: &Self,
+        w_down: &Self,
+        ffn_in: &[f32],
+        m: usize,
+        n_embd: usize,
+    ) -> Result<Vec<f32>> {
+        if let (Some(ref b_gate), Some(ref b_up), Some(ref b_down)) =
+            (&w_gate.gpu_buf, &w_up.gpu_buf, &w_down.gpu_buf)
+        {
+            if let Some(cuda) = crate::gpu::CudaEngine::global() {
+                let ffn_inter = w_gate.dims[0];
+                if let Some(down) =
+                    cuda.ffn_swiglu_fused(b_gate, b_up, b_down, ffn_in, m, n_embd, ffn_inter)
+                {
+                    return Ok(down);
+                }
+            }
+        }
+        let mut gate = w_gate.matmul_batched(ffn_in, m, n_embd)?;
+        let up = w_up.matmul_batched(ffn_in, m, n_embd)?;
+        let ffn_inter = gate.len() / m;
+        for i in 0..gate.len() {
+            gate[i] = silu(gate[i]) * up[i];
+        }
+        w_down.matmul_batched(&gate, m, ffn_inter)
     }
 }
 
@@ -1597,7 +1725,7 @@ impl Qwen35NativeEngine {
             }
         }
 
-        let tok_embeddings = gguf.tensor("token_embd.weight")?;
+        let tok_embeddings = gguf.tensor_no_gpu("token_embd.weight")?;
         let output_norm = gguf.tensor_f32_1d("output_norm.weight")?;
         let output = gguf
             .tensor("output.weight")
@@ -1752,9 +1880,14 @@ impl Qwen35NativeEngine {
 
             let mixer_out = match &mut blk.mixer {
                 Qwen35Mixer::FullAttention(attn) => {
-                    let q_gate_raw = attn.attn_q.matmul_batched(&normed, seq_len, n_embd)?;
-                    let mut k_raw = attn.attn_k.matmul_batched(&normed, seq_len, n_embd)?;
-                    let v_raw = attn.attn_v.matmul_batched(&normed, seq_len, n_embd)?;
+                    let (q_gate_raw, mut k_raw, v_raw) = MmapWeight::matmul_triple_same_input(
+                        &attn.attn_q,
+                        &attn.attn_k,
+                        &attn.attn_v,
+                        &normed,
+                        seq_len,
+                        n_embd,
+                    )?;
 
                     let mut q_only = vec![0.0f32; seq_len * n_heads * head_dim];
                     let mut gate_only = vec![0.0f32; seq_len * n_heads * head_dim];
@@ -1861,10 +1994,15 @@ impl Qwen35NativeEngine {
                         .matmul_batched(&attn_out, seq_len, n_heads * head_dim)?
                 }
                 Qwen35Mixer::GatedDeltaNet(ssm) => {
-                    let qkv_raw = ssm.attn_qkv.matmul_batched(&normed, seq_len, n_embd)?;
-                    let z_raw = ssm.attn_gate.matmul_batched(&normed, seq_len, n_embd)?;
-                    let alpha_raw = ssm.ssm_alpha.matmul_batched(&normed, seq_len, n_embd)?;
-                    let beta_raw = ssm.ssm_beta.matmul_batched(&normed, seq_len, n_embd)?;
+                    let (qkv_raw, z_raw, alpha_raw, beta_raw) = MmapWeight::matmul_quad_same_input(
+                        &ssm.attn_qkv,
+                        &ssm.attn_gate,
+                        &ssm.ssm_alpha,
+                        &ssm.ssm_beta,
+                        &normed,
+                        seq_len,
+                        n_embd,
+                    )?;
 
                     let d_k = ssm_state_size;
                     let n_k_heads = ssm_n_group;
@@ -1961,13 +2099,14 @@ impl Qwen35NativeEngine {
             }
 
             let ffn_in = rms_norm_rows(&x, &blk.post_attention_norm, rms_eps);
-            let mut gate = blk.ffn_gate.matmul_batched(&ffn_in, seq_len, n_embd)?;
-            let up = blk.ffn_up.matmul_batched(&ffn_in, seq_len, n_embd)?;
-            let ffn_inter = gate.len() / seq_len;
-            for i in 0..gate.len() {
-                gate[i] = silu(gate[i]) * up[i];
-            }
-            let down = blk.ffn_down.matmul_batched(&gate, seq_len, ffn_inter)?;
+            let down = MmapWeight::ffn_swiglu_batched(
+                &blk.ffn_gate,
+                &blk.ffn_up,
+                &blk.ffn_down,
+                &ffn_in,
+                seq_len,
+                n_embd,
+            )?;
             for i in 0..x.len() {
                 x[i] += down[i];
             }
@@ -2054,7 +2193,7 @@ impl StandardNativeEngine {
             }
         }
 
-        let tok_embeddings = gguf.tensor("token_embd.weight")?;
+        let tok_embeddings = gguf.tensor_no_gpu("token_embd.weight")?;
         let output_norm = gguf.tensor_f32_1d("output_norm.weight")?;
         let output = gguf
             .tensor("output.weight")
@@ -2145,9 +2284,14 @@ impl StandardNativeEngine {
                 }
             }
             let normed = rms_norm_rows(&x, &blk.attn_norm, rms_eps);
-            let mut q = blk.attn_q.matmul_batched(&normed, seq_len, n_embd)?;
-            let mut k = blk.attn_k.matmul_batched(&normed, seq_len, n_embd)?;
-            let mut v = blk.attn_v.matmul_batched(&normed, seq_len, n_embd)?;
+            let (mut q, mut k, mut v) = MmapWeight::matmul_triple_same_input(
+                &blk.attn_q,
+                &blk.attn_k,
+                &blk.attn_v,
+                &normed,
+                seq_len,
+                n_embd,
+            )?;
 
             if let Some(b) = &blk.attn_q_bias {
                 for row in q.chunks_exact_mut(b.len()) {
@@ -2252,13 +2396,14 @@ impl StandardNativeEngine {
             }
 
             let ffn_in = rms_norm_rows(&x, &blk.ffn_norm, rms_eps);
-            let mut gate = blk.ffn_gate.matmul_batched(&ffn_in, seq_len, n_embd)?;
-            let up = blk.ffn_up.matmul_batched(&ffn_in, seq_len, n_embd)?;
-            let ffn_inter = gate.len() / seq_len;
-            for i in 0..gate.len() {
-                gate[i] = silu(gate[i]) * up[i];
-            }
-            let down = blk.ffn_down.matmul_batched(&gate, seq_len, ffn_inter)?;
+            let down = MmapWeight::ffn_swiglu_batched(
+                &blk.ffn_gate,
+                &blk.ffn_up,
+                &blk.ffn_down,
+                &ffn_in,
+                seq_len,
+                n_embd,
+            )?;
             for i in 0..x.len() {
                 x[i] += down[i];
             }

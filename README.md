@@ -1,6 +1,6 @@
 # Hugging Face Local Assistant
 
-En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GGUF-språkmodeller med en egenutviklet inferensmotor, minnekartlegging, dynamisk ressursstyring og SIMD-optimaliserte kvantiseringskjerner.
+En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GGUF-språkmodeller med en egenutviklet GPU- og CPU-inferensmotor (CUDA Driver API PTX-kjerner og AVX2/FMA SIMD), minnekartlegging og dynamisk ressursstyring.
 
 <img width="833" height="539" alt="image" src="https://github.com/user-attachments/assets/358cd437-1927-45d1-afdc-f8a607513aaf" />
 <img width="833" height="536" alt="image" src="https://github.com/user-attachments/assets/515dd373-1091-44ba-ad74-f93c82161eeb" />
@@ -12,7 +12,7 @@ En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GG
 
 ## Oversikt
 
-Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne språkmodeller lokalt på Windows. Løsningen inkluderer maskinvareanalyse via Windows DXGI, integrasjon mot Hugging Face Hub API, automatisk nedlasting av vekter og tokenizere, samt en egenutviklet inferensmotor med dynamisk ressursregulering implementert direkte i Rust.
+Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne språkmodeller lokalt på Windows. Løsningen inkluderer maskinvareanalyse via Windows DXGI og NVIDIA NVML, integrasjon mot Hugging Face Hub API, automatisk nedlasting av vekter og tokenizere, samt en egenutviklet hybrid GPU/CPU-inferensmotor med dynamisk ressursregulering implementert direkte i Rust.
 
 ---
 
@@ -20,10 +20,12 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
 
 ### 1. Maskinvareanalyse og dynamisk ressursstyring (`ResourceGovernor`)
 - Registrerer CPU-arkitektur, antall logiske kjerner, totalt og ledig systemminne (RAM) samt tilgjengelig sidevekslingsfil via Win32 `GlobalMemoryStatusEx`.
-- Identifiserer dedikert GPU-videominne (VRAM) direkte via Windows `IDXGIFactory1` (`DXGI_ADAPTER_DESC1`).
-- **Trygg sub-maksimal ressursbruk**: Forhåndskonfigurerte `rayon`-trådpooler kjører med redusert trådprioritet (`THREAD_PRIORITY_BELOW_NORMAL` / `THREAD_PRIORITY_LOWEST`) og benytter under normal drift omtrent 75 % av tilgjengelige logiske kjerner slik at operativsystem, vindushåndtering og andre programmer alltid forblir responsive.
-- **Fokusbevisst skalering ved programbytte (`Alt+Tab`)**: Når applikasjonsvinduet mister fokus, skaleres antall aktive arbeidstråder og UI-oppdateringsfrekvens automatisk ned for å unngå ressurskonflikt med andre aktive programmer, og skaleres opp igjen når brukeren vender tilbake.
-- **Automatisk håndtering av lavt minne og overbelastning**: Ved lavt tilgjengelig minne eller høy systemlast reduseres trådantall og prefill-batchstørrelse dynamisk. Ved kritisk lavt minne frigjøres prosessens working set via `SetProcessWorkingSetSize`, og motoren tar korte, avbrytbare pauser inntil minnetrykket synker uten at genereringen henger seg opp eller stopper før svaret er ferdig.
+- Identifiserer dedikert GPU-videominne (VRAM), sanntids GPU-last, VRAM-bruk og GPU-temperatur via Windows DXGI (`IDXGIFactory1`) og NVIDIA Management Library (`nvml.dll`).
+- **Trygg sub-maksimal ressursbruk (GPU og CPU)**:
+  - **VRAM-sikkerhetsmargin**: Ved modellinnlasting reserveres alltid minst 1,2 GB (eller ~15 % av total VRAM) som fri margin slik at Windows Desktop Window Manager (DWM), brukergrensesnittet og andre åpne programmer aldri går tomme for videominne.
+  - **Dynamisk GPU- og CPU-skalering**: Under normal drift reguleres antall samtidige CUDA thread-blocks på GPU og aktive `rayon`-arbeidstråder på CPU (~75 % av logiske kjerner med `THREAD_PRIORITY_BELOW_NORMAL`) slik at maskinen yter maksimalt innenfor trygge rammer.
+- **Fokusbevisst skalering ved programbytte (`Alt+Tab`)**: Når applikasjonsvinduet mister fokus, skaleres både GPU-grid-størrelse, aktive CPU-tråder og UI-oppdateringsfrekvens automatisk ned for å gi full prioritet til det aktive programmet, og skaleres opp igjen når brukeren vender tilbake.
+- **Automatisk håndtering av lavt minne og overbelastning**: Ved lavt tilgjengelig RAM/VRAM eller høy GPU-temperatur reduseres ressursbruken dynamisk. Ved kritisk minnepress frigjøres prosessens working set via `SetProcessWorkingSetSize`, og motoren tar korte, avbrytbare pauser inntil belastningen synker uten at genereringen henger seg opp eller stopper før svaret er ferdig.
 
 ### 2. Hugging Face Hub-integrasjon
 - Søk og filtrering i åpne GGUF-modeller via Hugging Face REST API.
@@ -34,11 +36,14 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
 - Asynkron strømming av GGUF-filer med sanntids fremdriftsrapportering.
 - Automatisk deteksjon og nedlasting av kompatibel `tokenizer.json` for valgt modell, inkludert oppslag mot opprinnelig basemodell der GGUF-depotet kun inneholder binærvekter.
 
-### 4. Egenutviklet inferensmotor
+### 4. Egenutviklet GPU- og CPU-inferensmotor
+- **Direkte GPU-akselerasjon via CUDA Driver API (`nvcuda.dll`) og PTX**:
+  - Egenutviklede warp-reduserende CUDA PTX-kjerner (`matmul_q4k`, `matmul_q6k`, `matmul_q5k`, `matmul_q8_0`, `matmul_q4_0`, `matmul_f16`, `matmul_bf16`, `matmul_f32` og `swiglu_f32`) lastes direkte inn via `nvcuda.dll` uten krav om eksterne biblioteker ved kjøring.
+  - **Fusjonerte GPU-pipelines**: Q/K/V-projeksjoner og SSM-projeksjoner som deler samme input kjøres i grupperte GPU-kall med kun én PCIe-overføring, og hele SwiGLU Feed-Forward Network (`ffn_gate`, `ffn_up`, `swiglu_f32`, `ffn_down`) kjøres fusjonert i VRAM/L2-cache uten mellomliggende kopiering til CPU.
+  - **Hybrid GPU+CPU-fallback**: Lag og vekter som passer innenfor den trygge VRAM-rammen kjøres direkte på GPU, mens eventuelle overskytende vekter kjøres sømløst på CPU med AVX2 og FMA.
 - **Zero-Copy minnekartlegging**: Benytter Win32 API (`CreateFileMappingW` og `MapViewOfFile`) for å kartlegge fler-gigabyte `.gguf`-filer direkte fra disk uten unødig allokering i sidevekslingsfilen.
-- **Dynamisk oppdelt prefill (Chunked Prefill)**: Innkommende prompts prosesseres i dynamiske del-batches tilpasset ledig RAM. Dette reduserer midlertidige minneallokeringer drastisk og tillater kontinuerlig ressurssjekk og avbruddshåndtering.
+- **Dynamisk oppdelt prefill (Chunked Prefill)**: Innkommende prompts prosesseres i dynamiske del-batches tilpasset ledig RAM og VRAM.
 - **GGUF-parser**: Fullstendig parser for GGUF-formatversjoner 1, 2 og 3, inkludert metadatastruktur, arraytyper og tensordeskriptorer.
-- **SIMD-optimaliserte beregningskjerner**: AVX2- og FMA-akselerert vektor- og matrisemultiplikasjon for vanlige kvantiseringsformater (`Q4_K`, `Q6_K`, `Q5_K`, `Q8_0`, `Q4_0`, `F16`, `BF16`, `F32`), parallellisert via `ResourceGovernor`.
 - **Modellarkitekturer**:
   - `qwen35`: Hybridarkitektur med Gated DeltaNet State Space Model (SSM) og Full Attention (støtter opptil 8192 tokens kontekstlengde).
   - Standard Transformer: Støtte for modeller basert på RoPE, RMSNorm og SiLU/SwiGLU (inkludert Llama-, Mistral-, Gemma- og Phi-varianter).
@@ -46,7 +51,7 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
 
 ### 5. Brukergrensesnitt
 - **Grafisk grensesnitt (GUI)**: Bygget med `eframe` og `egui`.
-  - Topp-panel med sanntidsoversikt over maskinvare, aktiv ressursmodus, antall aktive tråder og tilgjengelig systemminne.
+  - Topp-panel med sanntidsoversikt over maskinvare, aktiv ressursmodus, mengde modellvekter i GPU VRAM, GPU-last (%), GPU-temperatur, aktive CPU-tråder og tilgjengelig systemminne.
   - Modellutforsker med søk og filter basert på minnekapasitet.
   - Lokal filoversikt med status for nedlastede vekter og tokenizere.
   - Dedikert fane for vurdering, justering og forhåndsgodkjenning av systeminstruksjoner (System Prompt).
@@ -69,6 +74,7 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
 
 - Operativsystem: Windows 10 eller Windows 11 (64-bit x86_64)
 - Prosessor: x86_64-prosessor med støtte for AVX2 og FMA instruksjonssett
+- Grafikkort (valgfritt, anbefalt): NVIDIA GPU med CUDA Driver API (`nvcuda.dll`) for maskinvareakselerert GGUF-inferens i VRAM
 - Kompilator: Rust 1.75 eller nyere (ved kompilering fra kildekode)
 
 ---
@@ -96,14 +102,16 @@ cargo run --release -- --cli
 
 ```
 src/
-  main.rs         Inngangspunkt for applikasjonen (velger GUI eller CLI)
-  ui.rs           Grafisk brukergrensesnitt implementert med egui/eframe
-  inference.rs    Egenutviklet inferensmotor (GGUF-parser, Win32 mmap, SIMD-kjerner, tilstandsbasert fortsettelse)
-  ocr.rs          OCR-integrasjon og utklippstavlehåndtering
-  hardware.rs     Maskinvaredeteksjon via Windows DXGI og dynamisk ressursstyring (ResourceGovernor)
-  hf_client.rs    Klient mot Hugging Face Hub API med hastighetsbegrensning
-  recommender.rs  Beregning av minnebehov og maskinvarekompatibilitet
-  downloader.rs   Håndtering av filnedlastinger og oppløsning av tokenizer
+  main.rs             Inngangspunkt for applikasjonen (velger GUI eller CLI)
+  ui.rs               Grafisk brukergrensesnitt implementert med egui/eframe
+  gpu.rs              CUDA Driver API (nvcuda.dll) PTX-akselerator og NVML (nvml.dll) GPU-telemetri
+  gguf_kernels.ptx    Forhåndskompilerte CUDA PTX-kjerner for kvantiserte GGUF-matriseoperasjoner og SwiGLU
+  inference.rs        Egenutviklet inferensmotor (GGUF-parser, Win32 mmap, GPU/CPU-dispatch, tilstandsbasert fortsettelse)
+  ocr.rs              OCR-integrasjon og utklippstavlehåndtering
+  hardware.rs         Maskinvaredeteksjon via Windows DXGI/NVML og dynamisk ressursstyring (ResourceGovernor)
+  hf_client.rs        Klient mot Hugging Face Hub API med hastighetsbegrensning
+  recommender.rs      Beregning av minnebehov og maskinvarekompatibilitet
+  downloader.rs       Håndtering av filnedlastinger og oppløsning av tokenizer
 tools/
-  ocr_engine.py   RapidOCR (PP-OCRv4 ONNX) layout- og linjeskiftrekonstruksjon
+  ocr_engine.py       RapidOCR (PP-OCRv4 ONNX) layout- og linjeskiftrekonstruksjon
 ```

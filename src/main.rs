@@ -1,4 +1,5 @@
 mod downloader;
+mod gpu;
 mod hardware;
 mod hf_client;
 mod inference;

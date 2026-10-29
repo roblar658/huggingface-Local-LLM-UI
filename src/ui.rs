@@ -1239,17 +1239,33 @@ impl HfAssistantApp {
                     }
                 };
 
+                {
+                    let mut guard = arc_llm.lock().unwrap();
+                    *guard = None;
+                }
                 match LocalLlm::load(&p_clone, &tok_path) {
                     Ok(mut model) => {
                         model.set_resource_governor(gov);
                         let arch = model.architecture.clone();
+                        let gpu_info = if let Some(cuda) = crate::gpu::CudaEngine::global() {
+                            let gb = cuda.offloaded_bytes.load(Ordering::Relaxed) as f64
+                                / (1024.0 * 1024.0 * 1024.0);
+                            let tens = cuda.offloaded_tensors.load(Ordering::Relaxed);
+                            format!(
+                                " [{:.2} GB / {} tensorer i GPU VRAM på {}]",
+                                gb, tens, cuda.device_name
+                            )
+                        } else {
+                            String::new()
+                        };
                         let mut guard = arc_llm.lock().unwrap();
                         *guard = Some(model);
                         ui_ctx.request_repaint();
                         let _ = tx.send(AppEvent::ModelLoadResult(Ok(format!(
-                            "Modell {:?} (arkitektur: {}) er ferdig lastet inn og klar for prompting!",
+                            "Modell {:?} (arkitektur: {}){} er ferdig lastet inn og klar for prompting!",
                             p_clone.file_name().unwrap_or_default(),
-                            arch
+                            arch,
+                            gpu_info
                         ))));
                     }
                     Err(e) => {

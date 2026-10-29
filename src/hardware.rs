@@ -1,5 +1,5 @@
-use anyhow::{ anyhow, Result };
-use std::sync::atomic::{ AtomicBool, Ordering };
+use anyhow::{anyhow, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use sysinfo::System;
 
 #[derive(Debug, Clone)]
@@ -27,8 +27,23 @@ impl HardwareSpec {
         let total_ram_gb = sys.total_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
         let available_ram_gb = sys.available_memory() as f64 / 1024.0 / 1024.0 / 1024.0;
 
-        let (gpu_name, dedicated_vram_gb) = detect_windows_gpu()
+        let (mut gpu_name, mut dedicated_vram_gb) = detect_windows_gpu()
             .unwrap_or_else(|_| ("Standard Windows GPU".to_string(), 0.0));
+
+        // Suppler med NVML/CUDA dersom DXGI rapporterer 4GB-tak på 32-bit struktur eller vi har direkte NVML
+        if let Some(tel) = crate::gpu::query_gpu_telemetry() {
+            if tel.vram_total_mb > 0 {
+                let nvml_gb = tel.vram_total_mb as f64 / 1024.0;
+                if nvml_gb > dedicated_vram_gb {
+                    dedicated_vram_gb = nvml_gb;
+                }
+            }
+        }
+        if let Some(cuda) = crate::gpu::CudaEngine::global() {
+            if !cuda.device_name.is_empty() {
+                gpu_name = format!("{} (CUDA PTX aktiv)", cuda.device_name);
+            }
+        }
 
         Ok(HardwareSpec {
             cpu_brand,
@@ -43,11 +58,11 @@ impl HardwareSpec {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceLevel {
-    /// Normal drift: bruker ~75% av logiske kjerner (trygt under maks kapasitet)
+    /// Normal drift: bruker trygt sub-maks av GPU og ~75% av CPU-kjerner
     OptimalSubMax,
     /// Moderat ressursbruk eller når brukeren har byttet til et annet program (Alt+Tab)
     Balanced,
-    /// Lite ledig RAM / høy systemlast: reduserer tråder og legger inn mikropauser
+    /// Lite ledig RAM/VRAM eller høy temperatur: reduserer GPU-grid og CPU-tråder
     LowResources,
     /// Kritisk lavt minne / overbelastet: frigjør working set og tar en midlertidig pause
     CriticalPause,
@@ -64,6 +79,13 @@ pub struct ResourceSnapshot {
     pub total_cores: usize,
     pub prefill_chunk_size: usize,
     pub throttle_sleep_ms: u64,
+    pub gpu_active: bool,
+    pub gpu_util_pct: u32,
+    pub gpu_vram_used_mb: u64,
+    pub gpu_vram_free_mb: u64,
+    pub gpu_vram_total_mb: u64,
+    pub gpu_offloaded_mb: u64,
+    pub gpu_temp_c: u32,
 }
 
 impl ResourceSnapshot {
@@ -77,16 +99,36 @@ impl ResourceSnapshot {
                     "Balansert"
                 }
             }
-            ResourceLevel::LowResources => "Lavt minne (redusert fart)",
-            ResourceLevel::CriticalPause => "Kritisk minne (midlertidig pause)",
+            ResourceLevel::LowResources => "Lavt minne/høy last (redusert)",
+            ResourceLevel::CriticalPause => "Kritisk last (midlertidig pause)",
         };
-        format!(
-            "{} [{}/{} tråder | {:.1} GB ledig]",
-            mode_str,
-            self.recommended_threads,
-            self.total_cores,
-            self.avail_phys_mb as f64 / 1024.0
-        )
+
+        if self.gpu_active {
+            let temp_part = if self.gpu_temp_c > 0 {
+                format!(", {}°C", self.gpu_temp_c)
+            } else {
+                String::new()
+            };
+            format!(
+                "{} [GPU: {:.1} GB i VRAM ({}% last{}) | {}/{} tråder | {:.1} GB RAM ledig]",
+                mode_str,
+                self.gpu_offloaded_mb as f64 / 1024.0,
+                self.gpu_util_pct,
+                temp_part,
+                self.recommended_threads,
+                self.total_cores,
+                self.avail_phys_mb as f64 / 1024.0
+            )
+        } else {
+            format!(
+                "{} [{}/{} tråder | {:.1} GB RAM ledig ({}% brukt)]",
+                mode_str,
+                self.recommended_threads,
+                self.total_cores,
+                self.avail_phys_mb as f64 / 1024.0,
+                self.memory_load_pct
+            )
+        }
     }
 }
 
@@ -115,7 +157,9 @@ impl ResourceGovernor {
         } else if total_cores <= 4 {
             total_cores - 1
         } else {
-            ((total_cores * 3) / 4).min(total_cores.saturating_sub(2)).max(2)
+            ((total_cores * 3) / 4)
+                .min(total_cores.saturating_sub(2))
+                .max(2)
         };
 
         let balanced_threads = (total_cores / 2).max(1).min(submax_threads);
@@ -166,17 +210,63 @@ impl ResourceGovernor {
         let (avail_phys_mb, avail_page_file_mb, memory_load_pct) = query_fast_memory_status();
         let app_focused = self.is_app_focused();
 
+        let tel = crate::gpu::query_gpu_telemetry().unwrap_or_default();
+        let (gpu_active, gpu_offloaded_mb) = if let Some(cuda) = crate::gpu::CudaEngine::global() {
+            let bytes = cuda.offloaded_bytes.load(Ordering::Relaxed);
+            (true, (bytes / (1024 * 1024)) as u64)
+        } else {
+            (false, 0)
+        };
+
+        let vram_critical = tel.vram_total_mb > 0 && tel.vram_free_mb < 320;
+        let vram_low = tel.vram_total_mb > 0 && tel.vram_free_mb < 700;
+        let gpu_hot_crit = tel.temp_c >= 87;
+        let gpu_hot_low = tel.temp_c >= 83;
+        let gpu_hot_bal = tel.temp_c >= 79;
+
         let (level, recommended_threads, prefill_chunk_size, throttle_sleep_ms) =
-            if avail_phys_mb < 500 || avail_page_file_mb < 500 || memory_load_pct >= 96 {
+            if avail_phys_mb < 480
+                || avail_page_file_mb < 480
+                || memory_load_pct >= 96
+                || vram_critical
+                || gpu_hot_crit
+            {
                 (ResourceLevel::CriticalPause, 1, 4, 45)
-            } else if avail_phys_mb < 1100 || avail_page_file_mb < 1000 || memory_load_pct >= 90 {
-                (ResourceLevel::LowResources, self.low_threads, 8, 14)
-            } else if !app_focused || avail_phys_mb < 2100 || avail_page_file_mb < 1900 || memory_load_pct >= 82 {
-                let sleep_ms = if !app_focused { 2 } else { 4 };
+            } else if avail_phys_mb < 1050
+                || avail_page_file_mb < 950
+                || memory_load_pct >= 90
+                || vram_low
+                || gpu_hot_low
+            {
+                (ResourceLevel::LowResources, self.low_threads, 8, 12)
+            } else if !app_focused
+                || avail_phys_mb < 2000
+                || avail_page_file_mb < 1800
+                || memory_load_pct >= 82
+                || gpu_hot_bal
+            {
+                let sleep_ms = if !app_focused { 2 } else { 3 };
                 (ResourceLevel::Balanced, self.balanced_threads, 16, sleep_ms)
             } else {
-                (ResourceLevel::OptimalSubMax, self.submax_threads, 24, 0)
+                (ResourceLevel::OptimalSubMax, self.submax_threads, 32, 0)
             };
+
+        // Oppdater dynamisk CUDA thread-block tak slik at GPU alltid holder seg trygt under maks
+        if let Some(cuda) = crate::gpu::CudaEngine::global() {
+            let grid_cap = match level {
+                ResourceLevel::OptimalSubMax => {
+                    if tel.gpu_util_pct >= 90 {
+                        96
+                    } else {
+                        144
+                    }
+                }
+                ResourceLevel::Balanced => 56,
+                ResourceLevel::LowResources => 24,
+                ResourceLevel::CriticalPause => 8,
+            };
+            cuda.max_grid_x.store(grid_cap, Ordering::Relaxed);
+        }
 
         ResourceSnapshot {
             avail_phys_mb,
@@ -188,6 +278,13 @@ impl ResourceGovernor {
             total_cores: self.total_cores,
             prefill_chunk_size,
             throttle_sleep_ms,
+            gpu_active,
+            gpu_util_pct: tel.gpu_util_pct,
+            gpu_vram_used_mb: tel.vram_used_mb,
+            gpu_vram_free_mb: tel.vram_free_mb,
+            gpu_vram_total_mb: tel.vram_total_mb,
+            gpu_offloaded_mb,
+            gpu_temp_c: tel.temp_c,
         }
     }
 
@@ -204,8 +301,8 @@ impl ResourceGovernor {
         }
     }
 
-    /// Sjekker ressurser før et inferens-steg. Tar automatiske, avbrytbare mikropauser ved
-    /// kritisk lavt minne / overbelastning, men låser aldri tråden permanent.
+    /// Sjekker CPU-, RAM- og GPU-ressurser før et inferens-steg. Tar automatiske, avbrytbare
+    /// mikropauser ved kritisk lavt minne / overbelastning uten å låse tråden permanent.
     pub fn pace_and_recover<F>(
         &self,
         cancel_flag: Option<&AtomicBool>,
@@ -225,8 +322,6 @@ impl ResourceGovernor {
         match snap.level {
             ResourceLevel::CriticalPause => {
                 trim_process_working_set();
-                // Vent i opptil 15 x 200ms (3.0s maks per steg) for at OS skal frigjøre RAM.
-                // Fortsetter deretter på 1 tråd slik at genereringen aldri henger fast.
                 for step in 0..15 {
                     if let Some(flag) = cancel_flag {
                         if flag.load(Ordering::Relaxed) {
@@ -235,8 +330,8 @@ impl ResourceGovernor {
                     }
                     if step == 0 || step % 5 == 0 {
                         on_status(&format!(
-                            "Lite ledig minne ({} MB RAM / {}% brukt) – tar en kort automatisk pause for å unngå heng...",
-                            snap.avail_phys_mb, snap.memory_load_pct
+                            "Høy belastning ({} MB RAM ledig, {} MB VRAM ledig) – tar en kort automatisk pause for å unngå heng...",
+                            snap.avail_phys_mb, snap.gpu_vram_free_mb
                         ));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -341,7 +436,7 @@ pub fn trim_process_working_set() {}
 
 #[cfg(windows)]
 fn detect_windows_gpu() -> Result<(String, f64)> {
-    use windows::Win32::Graphics::Dxgi::{ CreateDXGIFactory1, IDXGIFactory1 };
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
