@@ -1,56 +1,86 @@
-# 🤖 Hugging Face Local Assistant (Windows / Rust GUI & CLI)
+# Hugging Face Local Assistant
 
-En rask, brukervennlig lokal AI-assistent for Windows skrevet i **Rust**, med **100 % egenutviklet inferensmotor** (uten `llama.cpp`), **zero-copy minnekartlegging (`MapViewOfFile`)** og **AVX2 + FMA SIMD-akselererte kvantiseringskjerner**.
-
----
-
-## ✨ Hovedfunksjoner
-
-1. **Lokal maskinvareanalyse (Windows DXGI & System-RAM)**
-   - Detekterer automatisk CPU-modell og antall logiske kjerner, total/tilgjengelig RAM og dedikert GPU VRAM direkte via Windows `IDXGIFactory1` (`DXGI_ADAPTER_DESC1`).
-2. **Høflig Hugging Face Hub-utforsker**
-   - Søker etter åpne GGUF-modeller via Hugging Face Hub API med egendefinert `User-Agent`, automatisk pause mellom forespørsler (rate-limit-vennlig) og eksponentiell backoff ved HTTP 429.
-   - Vurderer hver modell mot PC-ens tilgjengelige GPU VRAM og system-RAM (`🟢 Rask (Full GPU VRAM)`, `🟡 Medium (System-RAM / CPU)`, `🔴 For stor for maskinvaren`).
-3. **Smart GGUF- og Tokenizer-nedlaster**
-   - Strømmer `.gguf`-filer med sanntids fremdriftsindikator.
-   - Finner og laster automatisk ned tilhørende `tokenizer.json` (inkludert automatisk oppslag i moder-depotet når GGUF-depotet kun inneholder `.gguf`-vektene).
-4. **100 % Egenutviklet Rust Inferensmotor (`src/inference.rs`)**
-   - **Zero-Copy Windows Minnekartlegging (`CreateFileMappingW` + `MapViewOfFile`)**: Kartlegger fler-gigabyte `.gguf`-modeller direkte fra disk på under 5 ms uten å spise av Windows Commit Charge / sidevekslingsfil.
-   - **Egen GGUF v1/v2/v3-parser**: Leser metadata og tensor-offsets direkte fra minnekartet.
-   - **Egne AVX2 + FMA 256-bit SIMD-kjerner**: Maskinvareakselerert matrisemultiplikasjon (`Q4_K`, `Q6_K`, `Q5_K`, `Q8_0`, `Q4_0`, `F16`, `BF16`, `F32`) parallellisert over alle CPU-tråder med `rayon`.
-   - **Støtter både `qwen35` (Gated DeltaNet SSM + Full Attention) og standard Transformer-modeller (`llama`, `qwen2`, `mistral`, `gemma`, `phi3`)**.
-5. **Brukervennlig Windows GUI (`eframe` / `egui`) og CLI-modus (`--cli`)**
-   - **🔍 Utforsk HF Modeller**: Søk, filtrer etter maskinvaretilpasning og last ned kvantiseringer (`Q4_K_M` osv.).
-   - **📥 Nedlastinger & Lokale Modeller**: Oversikt over lokale `.gguf`-filer i `models/` med ett-klikks innlasting.
-   - **⚙️ System Prompt**: Egen fane for vurdering, forhåndsmaler, estimering av prefill-kostnad og godkjenning av System Prompt før bruk.
-   - **💬 Chat & Prompting**: Høykontrast hvit tekst, justerbar temperatur/max tokens og umiddelbar avbryting (`⏹ Avbryt` / `Esc`).
+En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GGUF-språkmodeller med en egenutviklet inferensmotor, minnekartlegging og SIMD-optimaliserte kvantiseringskjerner.
 
 ---
 
-## 🚀 Kjøring og bygging
+## Oversikt
 
-### Krav
-- Windows 10 / 11 (x86_64 med AVX2/FMA)
-- Rust (`cargo` / `rustc`)
+Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne språkmodeller lokalt på Windows. Løsningen inkluderer maskinvareanalyse via Windows DXGI, integrasjon mot Hugging Face Hub API, automatisk nedlasting av vekter og tokenizere, samt en egenutviklet inferensmotor implementert direkte i Rust.
 
-### Bygg og start Windows GUI (standard)
+---
+
+## Funksjonalitet og arkitektur
+
+### 1. Maskinvareanalyse (Windows DXGI og systemminne)
+- Registrerer CPU-arkitektur, antall logiske kjerner, totalt og ledig systemminne (RAM).
+- Identifiserer dedikert GPU-videominne (VRAM) direkte via Windows `IDXGIFactory1` (`DXGI_ADAPTER_DESC1`).
+- Beregner kompatibilitet for modeller og kvantiseringer opp mot tilgjengelig minne før nedlasting.
+
+### 2. Hugging Face Hub-integrasjon
+- Søk og filtrering i åpne GGUF-modeller via Hugging Face REST API.
+- Strukturert forespørselshåndtering med egendefinert User-Agent, rate-limiting og eksponentiell tilbakeholdelse ved HTTP 429.
+- Automatisk analyse og klassifisering av modeller basert på om de får plass i dedikert VRAM, system-RAM eller overskrider maskinvarens kapasitet.
+
+### 3. Nedlasting og tokenisering
+- Asynkron strømming av GGUF-filer med sanntids fremdriftsrapportering.
+- Automatisk deteksjon og nedlasting av kompatibel `tokenizer.json` for valgt modell, inkludert oppslag mot opprinnelig basemodell der GGUF-depotet kun inneholder binærvekter.
+
+### 4. Egenutviklet inferensmotor
+- **Zero-Copy minnekartlegging**: Benytter Win32 API (`CreateFileMappingW` og `MapViewOfFile`) for å kartlegge fler-gigabyte `.gguf`-filer direkte fra disk uten unødig allokering i sidevekslingsfilen.
+- **GGUF-parser**: Fullstendig parser for GGUF-formatversjoner 1, 2 og 3, inkludert metadatastruktur, arraytyper og tensordeskriptorer.
+- **SIMD-optimaliserte beregningskjerner**: AVX2- og FMA-akselerert vektor- og matrisemultiplikasjon for vanlige kvantiseringsformater (`Q4_K`, `Q6_K`, `Q5_K`, `Q8_0`, `Q4_0`, `F16`, `BF16`, `F32`), parallellisert med `rayon`.
+- **Modellarkitekturer**:
+  - `qwen35`: Hybridarkitektur med Gated DeltaNet State Space Model (SSM) og Full Attention.
+  - Standard Transformer: Støtte for modeller basert på RoPE, RMSNorm og SiLU/SwiGLU (inkludert Llama-, Mistral-, Gemma- og Phi-varianter).
+- **Sampling og kontroll**: Temperatur- og Top-P-sampling samt umiddelbar avbruddshåndtering under generering og prefill via atomiske flagg.
+
+### 5. Brukergrensesnitt
+- **Grafisk grensesnitt (GUI)**: Bygget med `eframe` og `egui`.
+  - Modellutforsker med søk og filter basert på minnekapasitet.
+  - Lokal filoversikt med status for nedlastede vekter og tokenizere.
+  - Dedikert fane for vurdering, justering og forhåndsgodkjenning av systeminstruksjoner (System Prompt).
+  - Samtalepanel med høykontrast-tekst, justerbare inferensparametere og avbryt-funksjon.
+- **Kommandolinjegrensesnitt (CLI)**: Støtte for ren terminalbasert interaksjon via flagget `--cli`.
+
+---
+
+## Systemkrav
+
+- Operativsystem: Windows 10 eller Windows 11 (64-bit x86_64)
+- Prosessor: x86_64-prosessor med støtte for AVX2 og FMA instruksjonssett
+- Kompilator: Rust 1.75 eller nyere (ved kompilering fra kildekode)
+
+---
+
+## Kompilering og oppstart
+
+### Kompilering (Release)
+```powershell
+cargo build --release
+```
+
+### Starte grafisk grensesnitt (GUI)
 ```powershell
 cargo run --release
 ```
 
-### Start i terminal / CLI-modus
+### Starte kommandolinjegrensesnitt (CLI)
 ```powershell
 cargo run --release -- --cli
 ```
 
 ---
 
-## 📁 Prosjektstruktur
+## Prosjektstruktur
 
-- `src/main.rs` – Oppstart av Windows GUI (standard) eller CLI (`--cli`).
-- `src/ui.rs` – Windows-brukergrensesnitt i `eframe`/`egui`.
-- `src/inference.rs` – 100 % egenutviklet GGUF-parser, Win32 `MapViewOfFile`, AVX2+FMA kvantiseringskjerner, `Qwen35` Gated DeltaNet SSM + Full Attention, standard Transformer og Top-P/Temperatur-sampler.
-- `src/hardware.rs` – Deteksjon av CPU, RAM og dedikert GPU VRAM via Windows DXGI.
-- `src/hf_client.rs` – Høflig klient mot Hugging Face Hub API.
-- `src/recommender.rs` – Estimering av modellstørrelse og minnekrav mot lokal maskinvare.
-- `src/downloader.rs` – Nedlasting av `.gguf` og automatisk oppløsning av `tokenizer.json`.
+```
+src/
+  main.rs         Inngangspunkt for applikasjonen (velger GUI eller CLI)
+  ui.rs           Grafisk brukergrensesnitt implementert med egui/eframe
+  inference.rs    Egenutviklet inferensmotor (GGUF-parser, Win32 mmap, SIMD-kjerner, sampling)
+  hardware.rs     Maskinvaredeteksjon via Windows DXGI og systemkall
+  hf_client.rs    Klient mot Hugging Face Hub API med hastighetsbegrensning
+  recommender.rs  Beregning av minnebehov og maskinvarekompatibilitet
+  downloader.rs   Håndtering av filnedlastinger og oppløsning av tokenizer
+```
