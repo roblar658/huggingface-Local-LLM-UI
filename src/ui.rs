@@ -1,4 +1,4 @@
-use crate::hardware::HardwareSpec;
+use crate::hardware::{HardwareSpec, ResourceGovernor, ResourceLevel, ResourceSnapshot};
 use crate::hf_client::{HfModel, HfPoliteClient};
 use crate::inference::LocalLlm;
 use crate::recommender::{assess_model, FitLevel};
@@ -92,6 +92,10 @@ pub struct HfAssistantApp {
     is_pasting_image: bool,
     is_generating: bool,
     cancel_flag: Arc<AtomicBool>,
+    egui_ctx: egui::Context,
+    resource_governor: Arc<ResourceGovernor>,
+    resource_snapshot: ResourceSnapshot,
+    last_resource_refresh: std::time::Instant,
 }
 
 impl HfAssistantApp {
@@ -143,7 +147,15 @@ impl HfAssistantApp {
             is_pasting_image: false,
             is_generating: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            egui_ctx: cc.egui_ctx.clone(),
+            resource_governor: {
+                let gov = Arc::new(ResourceGovernor::new());
+                gov
+            },
+            resource_snapshot: ResourceGovernor::new().sample(),
+            last_resource_refresh: std::time::Instant::now(),
         };
+        app.resource_snapshot = app.resource_governor.sample();
 
         // 1. Detekter maskinvare asynkront
         let tx = event_tx.clone();
@@ -346,6 +358,7 @@ impl HfAssistantApp {
         let use_context = self.use_context;
         let auto_eval = self.auto_evaluate_and_continue;
         let history_snapshot = self.chat_history.clone();
+        let ui_ctx = self.egui_ctx.clone();
 
         thread::spawn(move || {
             // 1. Kjør OCR på alle vedlagte bilder med linjeskift og mellomrom bevart
@@ -410,15 +423,18 @@ impl HfAssistantApp {
                 (final_prompt.clone(), base_system_prompt)
             };
 
-            // 3. Utfør inferens
+            // 3. Utfør inferens med dynamisk ressursstyring og anti-hang
             let mut guard = llm_arc.lock().unwrap();
             if let Some(ref mut llm) = *guard {
                 let tx_token = tx.clone();
+                let tx_status = tx.clone();
+                let ctx_tok = ui_ctx.clone();
+                let ctx_stat = ui_ctx.clone();
                 let cancel_for_cb = cancel_arc.clone();
                 let first_answer_ref = Arc::new(Mutex::new(String::new()));
                 let first_ans_cb = first_answer_ref.clone();
 
-                let res = llm.generate_with_callback(
+                let res = llm.generate_with_callback_and_status(
                     &sys_to_send,
                     disable_think,
                     &prompt_to_send,
@@ -426,20 +442,26 @@ impl HfAssistantApp {
                     temp,
                     p,
                     Some(cancel_arc.as_ref()),
+                    move |status_str| {
+                        let _ = tx_status.send(AppEvent::InferenceStatus(status_str.to_string()));
+                        ctx_stat.request_repaint();
+                    },
                     move |token| {
                         if cancel_for_cb.load(Ordering::Relaxed) {
                             return false;
                         }
                         if let Ok(mut g) = first_ans_cb.lock() {
-                            g.push_str(&token);
+                            g.push_str(token);
                         }
                         let _ = tx_token.send(AppEvent::InferenceToken(token.to_string()));
+                        ctx_tok.request_repaint();
                         true
                     },
                 );
 
                 if cancel_arc.load(Ordering::Relaxed) {
                     let _ = tx.send(AppEvent::InferenceCancelled);
+                    ui_ctx.request_repaint();
                     return;
                 } else if let Err(e) = res {
                     let msg = e.to_string();
@@ -448,114 +470,60 @@ impl HfAssistantApp {
                     } else {
                         let _ = tx.send(AppEvent::InferenceError(msg));
                     }
+                    ui_ctx.request_repaint();
                     return;
                 }
 
-                // 4. Automatisk vurdering og fortsettelse (om aktivert)
+                // 4. Lynrask tilstandsbasert vurdering og automatisk fortsettelse (uten re-prefill/hang)
                 let first_ans = first_answer_ref.lock().unwrap().clone();
-                let first_ans_trimmed = first_ans.trim();
-
-                if auto_eval && !first_ans_trimmed.is_empty() {
-                    let _ = tx.send(AppEvent::InferenceStatus(
-                        "Vurderer automatisk om svaret er godt nok og fullstendig...".to_string(),
-                    ));
-
-                    let eval_sys = "Du er en objektiv og grundig evaluator. Vurder om svaret under er godt nok og tilstrekkelig besvart på brukerens henvendelse. Dersom svaret er komplett og godt nok, svar kun: GODT_NOK. Dersom svaret IKKE er godt nok, er avbrutt eller mangler viktige opplysninger, skriv FORTSETTELSE: etterfulgt av den manglende teksten for å fullføre svaret.";
-
-                    let eval_prompt = format!(
-                        "Brukerprompt: {}\n\nGenerert svar: {}\n\nOppgave: Vurder om svaret ovenfor er godt nok og fullstendig besvart. Svar GODT_NOK hvis det er fullstendig, eller FORTSETTELSE: etterfulgt av fortsettelsen hvis det må fullføres.",
-                        final_prompt,
-                        first_ans_trimmed
-                    );
-
+                if auto_eval && !first_ans.trim().is_empty() {
                     let tx_eval_token = tx.clone();
                     let tx_eval_status = tx.clone();
+                    let ctx_eval_tok = ui_ctx.clone();
+                    let ctx_eval_stat = ui_ctx.clone();
                     let cancel_eval = cancel_arc.clone();
-                    let mut eval_buffer = String::new();
-                    let mut is_continuing = false;
-                    let mut separator_emitted = false;
 
-                    let eval_res = llm.generate_with_callback(
-                        eval_sys,
-                        true,
-                        &eval_prompt,
+                    let eval_res = llm.evaluate_and_continue_with_callback(
+                        &first_ans,
                         max_toks,
                         temp,
                         p,
                         Some(cancel_arc.as_ref()),
+                        move |status_str| {
+                            let _ = tx_eval_status.send(AppEvent::InferenceStatus(status_str.to_string()));
+                            ctx_eval_stat.request_repaint();
+                        },
                         move |token| {
                             if cancel_eval.load(Ordering::Relaxed) {
                                 return false;
                             }
-
-                            if !is_continuing {
-                                eval_buffer.push_str(&token);
-                                let upper = eval_buffer.to_uppercase();
-
-                                if upper.contains("GODT_NOK") || upper.contains("GODT NOK") {
-                                    let _ = tx_eval_status.send(AppEvent::InferenceStatus(
-                                        "Vurdert: Svaret er godt nok og fullstendig.".to_string(),
-                                    ));
-                                    return false; // Fullført!
-                                }
-
-                                if let Some(pos) = upper.find("FORTSETTELSE:").or_else(|| upper.find("FORTSETT:")) {
-                                    is_continuing = true;
-                                    if !separator_emitted {
-                                        separator_emitted = true;
-                                        let _ = tx_eval_status.send(AppEvent::InferenceStatus(
-                                            "Svaret var ufullstendig – fortsetter og fullfører automatisk...".to_string(),
-                                        ));
-                                        let _ = tx_eval_token.send(AppEvent::InferenceToken(
-                                            "\n\n**Fortsettelse:**\n".to_string(),
-                                        ));
-                                        let kw_len = if upper[pos..].starts_with("FORTSETTELSE:") { 13 } else { 9 };
-                                        let rest = eval_buffer[pos + kw_len..].trim_start();
-                                        if !rest.is_empty() {
-                                            let _ = tx_eval_token.send(AppEvent::InferenceToken(rest.to_string()));
-                                        }
-                                    }
-                                } else if eval_buffer.len() > 50 {
-                                    is_continuing = true;
-                                    if !separator_emitted {
-                                        separator_emitted = true;
-                                        let _ = tx_eval_status.send(AppEvent::InferenceStatus(
-                                            "Utdyper og fullfører svaret automatisk...".to_string(),
-                                        ));
-                                        let _ = tx_eval_token.send(AppEvent::InferenceToken(
-                                            "\n\n**Utdypning:**\n".to_string(),
-                                        ));
-                                        let trimmed = eval_buffer.trim();
-                                        if !trimmed.is_empty() {
-                                            let _ = tx_eval_token.send(AppEvent::InferenceToken(trimmed.to_string()));
-                                        }
-                                    }
-                                }
-                            } else {
-                                let _ = tx_eval_token.send(AppEvent::InferenceToken(token.to_string()));
-                            }
-
+                            let _ = tx_eval_token.send(AppEvent::InferenceToken(token.to_string()));
+                            ctx_eval_tok.request_repaint();
                             true
                         },
                     );
 
                     if cancel_arc.load(Ordering::Relaxed) {
                         let _ = tx.send(AppEvent::InferenceCancelled);
+                        ui_ctx.request_repaint();
                         return;
                     } else if let Err(e) = eval_res {
                         let msg = e.to_string();
                         if msg.contains("Avbrutt av bruker") {
                             let _ = tx.send(AppEvent::InferenceCancelled);
+                            ui_ctx.request_repaint();
                             return;
                         }
                     }
                 }
 
                 let _ = tx.send(AppEvent::InferenceFinished);
+                ui_ctx.request_repaint();
             } else {
                 let _ = tx.send(AppEvent::InferenceError(
                     "Ingen modell er lastet inn i minnet enda. Gå til 'Nedlastinger & Lokale Modeller' og klikk 'Last inn & Åpne i Chat'.".to_string(),
                 ));
+                ui_ctx.request_repaint();
             }
         });
     }
@@ -563,6 +531,12 @@ impl HfAssistantApp {
 
 impl eframe::App for HfAssistantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let is_focused = ctx.input(|i| i.focused);
+        self.resource_governor.set_app_focused(is_focused);
+        if self.last_resource_refresh.elapsed() >= std::time::Duration::from_millis(600) {
+            self.resource_snapshot = self.resource_governor.sample();
+            self.last_resource_refresh = std::time::Instant::now();
+        }
         if self.enable_ocr_paste && !self.is_pasting_image {
             let wants_paste = ctx.input(|i| {
                 (i.modifiers.ctrl && i.key_pressed(egui::Key::V))
@@ -778,6 +752,21 @@ impl eframe::App for HfAssistantApp {
                             .strong()
                             .color(egui::Color32::from_rgb(50, 220, 100)),
                         );
+                        ui.separator();
+                        let badge_color = match self.resource_snapshot.level {
+                            ResourceLevel::OptimalSubMax => egui::Color32::from_rgb(80, 210, 255),
+                            ResourceLevel::Balanced => egui::Color32::from_rgb(180, 200, 255),
+                            ResourceLevel::LowResources => egui::Color32::from_rgb(245, 190, 60),
+                            ResourceLevel::CriticalPause => egui::Color32::from_rgb(255, 110, 90),
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "⚡ Ressursstyring: {}",
+                                self.resource_snapshot.status_badge()
+                            ))
+                            .color(badge_color)
+                            .strong(),
+                        );
                     } else {
                         ui.spinner();
                         ui.label("Analyserer lokal maskinvare...");
@@ -845,7 +834,8 @@ impl eframe::App for HfAssistantApp {
         });
 
         if self.downloading_filename.is_some() || self.is_generating || self.is_loading_llm {
-            ctx.request_repaint();
+            let repaint_ms = if is_focused { 33 } else { 150 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
         }
     }
 }
@@ -1218,6 +1208,8 @@ impl HfAssistantApp {
             let arc_llm = self.loaded_llm.clone();
             let tx = self.event_tx.clone();
             let handle = self.tokio_handle.clone();
+            let gov = self.resource_governor.clone();
+            let ui_ctx = self.egui_ctx.clone();
 
             self.is_loading_llm = true;
             self.status_msg = format!(
@@ -1248,10 +1240,12 @@ impl HfAssistantApp {
                 };
 
                 match LocalLlm::load(&p_clone, &tok_path) {
-                    Ok(model) => {
+                    Ok(mut model) => {
+                        model.set_resource_governor(gov);
                         let arch = model.architecture.clone();
                         let mut guard = arc_llm.lock().unwrap();
                         *guard = Some(model);
+                        ui_ctx.request_repaint();
                         let _ = tx.send(AppEvent::ModelLoadResult(Ok(format!(
                             "Modell {:?} (arkitektur: {}) er ferdig lastet inn og klar for prompting!",
                             p_clone.file_name().unwrap_or_default(),

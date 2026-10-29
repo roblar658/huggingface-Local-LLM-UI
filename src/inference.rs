@@ -1584,7 +1584,7 @@ impl Qwen35NativeEngine {
         let ssm_time_step_rank = gguf.get_usize("qwen35.ssm.time_step_rank").unwrap_or(32);
         let ssm_n_group = gguf.get_usize("qwen35.ssm.group_count").unwrap_or(16);
 
-        let max_seq_len = 2048usize;
+        let max_seq_len = 8192usize;
         let half_rope = rope_dim / 2;
         let mut rope_cos = vec![0.0f32; max_seq_len * half_rope];
         let mut rope_sin = vec![0.0f32; max_seq_len * half_rope];
@@ -1774,7 +1774,7 @@ impl Qwen35NativeEngine {
                     rms_norm_inplace(&mut k_raw, &attn.attn_k_norm, rms_eps);
 
                     for s in 0..seq_len {
-                        let pos = (start_pos + s).min(2047);
+                        let pos = (start_pos + s).min(8191);
                         let cos_row = &self.rope_cos[pos * half_rope..(pos + 1) * half_rope];
                         let sin_row = &self.rope_sin[pos * half_rope..(pos + 1) * half_rope];
 
@@ -2041,7 +2041,7 @@ impl StandardNativeEngine {
             .get_f32(&format!("{}.rope.freq_base", prefix_arch))
             .unwrap_or(10_000.0);
 
-        let max_seq_len = 2048usize;
+        let max_seq_len = 8192usize;
         let half_dim = head_dim / 2;
         let mut rope_cos = vec![0.0f32; max_seq_len * half_dim];
         let mut rope_sin = vec![0.0f32; max_seq_len * half_dim];
@@ -2172,7 +2172,7 @@ impl StandardNativeEngine {
             }
 
             for s in 0..seq_len {
-                let pos = (start_pos + s).min(2047);
+                let pos = (start_pos + s).min(8191);
                 let cos_row = &self.rope_cos[pos * half_dim..(pos + 1) * half_dim];
                 let sin_row = &self.rope_sin[pos * half_dim..(pos + 1) * half_dim];
                 for h in 0..n_heads {
@@ -2307,6 +2307,111 @@ pub struct LocalLlm {
     sampler: SelfMadeSampler,
     pub architecture: String,
     pub model_name: String,
+    current_pos: usize,
+    pending_token: Option<u32>,
+    stopped_at_limit: bool,
+    last_disable_thinking: bool,
+    governor: std::sync::Arc<crate::hardware::ResourceGovernor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EvalDecision {
+    Complete,
+    NeedMoreTokens,
+    ContinueWith(String),
+}
+
+fn looks_cut_off(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let last_ch = trimmed.chars().last().unwrap_or('.');
+    !matches!(
+        last_ch,
+        '.' | '!' | '?' | ')' | ']' | '}' | '"' | '»' | '\'' | '`' | '…'
+    )
+}
+
+fn has_excessive_repetition(tokens: &[u32]) -> bool {
+    let n = tokens.len();
+    if n >= 16 {
+        let last = tokens[n - 1];
+        if tokens[n - 16..].iter().all(|&t| t == last) {
+            return true;
+        }
+    }
+    for pat_len in 2..=24 {
+        if n >= pat_len * 4 {
+            let pat = &tokens[n - pat_len..];
+            let rep1 = &tokens[n - pat_len * 2..n - pat_len];
+            let rep2 = &tokens[n - pat_len * 3..n - pat_len * 2];
+            let rep3 = &tokens[n - pat_len * 4..n - pat_len * 3];
+            if pat == rep1 && pat == rep2 && pat == rep3 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn strip_continuation_prefix(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    let upper = trimmed.to_uppercase();
+    for prefix in [
+        "FORTSETTELSE:",
+        "FORTSETTELSE -",
+        "FORTSETTELSE",
+        "HER ER FORTSETTELSEN:",
+    ] {
+        if upper.starts_with(prefix) {
+            return trimmed[prefix.len()..].trim_start();
+        }
+    }
+    trimmed
+}
+
+fn classify_eval_buffer(buf: &str) -> EvalDecision {
+    let trimmed = buf.trim_start();
+    if trimmed.is_empty() {
+        return EvalDecision::NeedMoreTokens;
+    }
+    let upper = trimmed.to_uppercase();
+
+    for done_kw in [
+        "GODT_NOK",
+        "GODT NOK",
+        "SVARET ER GODT NOK",
+        "SVARET ER KOMPLETT",
+        "JA, SVARET ER GODT NOK",
+    ] {
+        if upper.starts_with(done_kw) {
+            return EvalDecision::Complete;
+        }
+        if done_kw.starts_with(&upper) && trimmed.len() < done_kw.len() {
+            return EvalDecision::NeedMoreTokens;
+        }
+    }
+
+    for cont_kw in ["FORTSETTELSE:", "HER ER FORTSETTELSEN:"] {
+        if cont_kw.starts_with(&upper) && trimmed.len() < cont_kw.len() {
+            return EvalDecision::NeedMoreTokens;
+        }
+    }
+
+    if upper.starts_with("FORTSETTELSE:") || upper.starts_with("HER ER FORTSETTELSEN:") {
+        let after = strip_continuation_prefix(trimmed);
+        if after.is_empty() {
+            return EvalDecision::NeedMoreTokens;
+        }
+        return EvalDecision::ContinueWith(after.to_string());
+    }
+
+    if trimmed.chars().count() < 16 {
+        return EvalDecision::NeedMoreTokens;
+    }
+
+    EvalDecision::ContinueWith(trimmed.to_string())
 }
 
 impl LocalLlm {
@@ -2352,6 +2457,7 @@ impl LocalLlm {
             .map_err(|e| anyhow!("Kunne ikke laste tokenizer: {}", e))?;
 
         let sampler = SelfMadeSampler::new(299792458, 0.7, 0.9);
+        let governor = std::sync::Arc::new(crate::hardware::ResourceGovernor::new());
 
         Ok(Self {
             engine,
@@ -2359,7 +2465,79 @@ impl LocalLlm {
             sampler,
             architecture,
             model_name,
+            current_pos: 0,
+            pending_token: None,
+            stopped_at_limit: false,
+            last_disable_thinking: true,
+            governor,
         })
+    }
+
+    pub fn set_resource_governor(
+        &mut self,
+        governor: std::sync::Arc<crate::hardware::ResourceGovernor>,
+    ) {
+        self.governor = governor;
+    }
+
+    fn eos_token_ids(&self) -> Vec<u32> {
+        let mut eos_ids: Vec<u32> = vec![2, 151643, 151645, 128001, 128009, 248044, 248046];
+        for tok_str in [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "</s>",
+            "<|eot_id|>",
+            "<|end_of_text|>",
+        ] {
+            if let Some(id) = self.tokenizer.token_to_id(tok_str) {
+                if !eos_ids.contains(&id) {
+                    eos_ids.push(id);
+                }
+            }
+        }
+        eos_ids
+    }
+
+    /// Prosesserer tokens i dynamiske del-batches tilpasset tilgjengelig RAM og CPU-last.
+    /// Dette eliminerer store midlertidige minneallokeringer og hindrer at maskinen fryser.
+    fn prefill_tokens_chunked<S>(
+        &mut self,
+        tokens: &[u32],
+        cancel_flag: Option<&AtomicBool>,
+        on_status: &mut S,
+    ) -> Result<Vec<f32>>
+    where
+        S: FnMut(&str),
+    {
+        if tokens.is_empty() {
+            bail!("Ingen tokens å prosessere i prefill");
+        }
+        let mut offset = 0usize;
+        let mut last_logits = Vec::new();
+        while offset < tokens.len() {
+            let snap = self.governor.pace_and_recover(cancel_flag, &mut *on_status)?;
+            let chunk_size = snap.prefill_chunk_size.max(1);
+            let end = (offset + chunk_size).min(tokens.len());
+
+            if tokens.len() > 28 && offset > 0 {
+                on_status(&format!(
+                    "Prosesserer kontekst ({}/{} tokens) – {}...",
+                    offset,
+                    tokens.len(),
+                    snap.status_badge()
+                ));
+            }
+
+            let slice = &tokens[offset..end];
+            let pos = self.current_pos;
+            let engine_ref = &mut self.engine;
+            last_logits = self
+                .governor
+                .run_in_optimal_pool(snap.level, || engine_ref.forward(slice, pos, cancel_flag))?;
+            self.current_pos += slice.len();
+            offset = end;
+        }
+        Ok(last_logits)
     }
 
     pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String> {
@@ -2388,14 +2566,48 @@ impl LocalLlm {
         temperature: f64,
         top_p: f64,
         cancel_flag: Option<&AtomicBool>,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<String>
     where
         F: FnMut(&str) -> bool,
     {
+        self.generate_with_callback_and_status(
+            system_prompt,
+            disable_thinking,
+            prompt,
+            max_tokens,
+            temperature,
+            top_p,
+            cancel_flag,
+            |_| {},
+            on_token,
+        )
+    }
+
+    pub fn generate_with_callback_and_status<S, F>(
+        &mut self,
+        system_prompt: &str,
+        disable_thinking: bool,
+        prompt: &str,
+        max_tokens: usize,
+        temperature: f64,
+        top_p: f64,
+        cancel_flag: Option<&AtomicBool>,
+        mut on_status: S,
+        mut on_token: F,
+    ) -> Result<String>
+    where
+        S: FnMut(&str),
+        F: FnMut(&str) -> bool,
+    {
+        crate::hardware::lower_current_thread_priority(false);
         self.sampler.temperature = temperature as f32;
         self.sampler.top_p = top_p as f32;
         self.engine.clear_state();
+        self.current_pos = 0;
+        self.pending_token = None;
+        self.stopped_at_limit = false;
+        self.last_disable_thinking = disable_thinking;
 
         let sys_clean = if system_prompt.trim().is_empty() {
             "Du er en ekstremt kortfattet assistent. Svar kun med selve svaret på norsk i maksimalt 1–2 korte setninger uten innledning. Om ikke mulig, øk antall setninger med 1 inntil det gir mening."
@@ -2425,28 +2637,20 @@ impl LocalLlm {
             return Ok(String::new());
         }
 
+        let eos_ids = self.eos_token_ids();
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut prev_decoded_len = 0usize;
 
-        let mut eos_ids: Vec<u32> = vec![2, 151643, 151645, 128001, 128009, 248044, 248046];
-        for tok_str in [
-            "<|im_end|>",
-            "<|endoftext|>",
-            "</s>",
-            "<|eot_id|>",
-            "<|end_of_text|>",
-        ] {
-            if let Some(id) = self.tokenizer.token_to_id(tok_str) {
-                if !eos_ids.contains(&id) {
-                    eos_ids.push(id);
-                }
-            }
+        // Dynamisk chunked prefill av promptet
+        let logits = self.prefill_tokens_chunked(&prompt_tokens, cancel_flag, &mut on_status)?;
+        let mut next_token = self.sampler.sample(&logits);
+
+        if eos_ids.contains(&next_token) {
+            return Ok(String::new());
         }
 
-        // Prefill hele promptet i én batch (hver vektrad i GGUF leses kun 1 gang fra minnekartet!)
-        let logits = self.engine.forward(&prompt_tokens, 0, cancel_flag)?;
-        let mut next_token = self.sampler.sample(&logits);
         generated_tokens.push(next_token);
+        self.pending_token = Some(next_token);
 
         if let Ok(decoded) = self.tokenizer.decode(&generated_tokens, true) {
             if decoded.len() > prev_decoded_len {
@@ -2457,22 +2661,32 @@ impl LocalLlm {
             }
         }
 
-        for index in 0..max_tokens.saturating_sub(1) {
-            if let Some(flag) = cancel_flag {
-                if flag.load(Ordering::Relaxed) {
-                    bail!("Avbrutt av bruker");
-                }
-            }
+        for _ in 0..max_tokens.saturating_sub(1) {
+            let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
             if eos_ids.contains(&next_token) {
+                self.pending_token = None;
                 break;
             }
-            let pos = prompt_tokens.len() + index;
-            let logits = self.engine.forward(&[next_token], pos, cancel_flag)?;
+            let tok_to_feed = self.pending_token.take().unwrap_or(next_token);
+            let pos = self.current_pos;
+            let engine_ref = &mut self.engine;
+            let logits = self.governor.run_in_optimal_pool(snap.level, || {
+                engine_ref.forward(&[tok_to_feed], pos, cancel_flag)
+            })?;
+            self.current_pos += 1;
+
             next_token = self.sampler.sample(&logits);
             if eos_ids.contains(&next_token) {
+                self.pending_token = None;
                 break;
             }
+
             generated_tokens.push(next_token);
+            self.pending_token = Some(next_token);
+
+            if has_excessive_repetition(&generated_tokens) {
+                break;
+            }
 
             if let Ok(decoded) = self.tokenizer.decode(&generated_tokens, true) {
                 if decoded.len() > prev_decoded_len {
@@ -2485,11 +2699,263 @@ impl LocalLlm {
             }
         }
 
+        if self.pending_token.is_some() {
+            self.stopped_at_limit = true;
+        }
+
         println!();
         let final_text = self
             .tokenizer
             .decode(&generated_tokens, true)
             .map_err(|e| anyhow!("Dekodingsfeil: {}", e))?;
         Ok(final_text)
+    }
+
+    /// Gjenbruker eksisterende KV-cache / SSM-tilstand for å raskt fullføre avkuttede setninger
+    /// og vurdere om svaret er godt nok uten å måtte prosessere hele samtalen på nytt.
+    pub fn evaluate_and_continue_with_callback<S, F>(
+        &mut self,
+        current_answer: &str,
+        max_tokens: usize,
+        temperature: f64,
+        top_p: f64,
+        cancel_flag: Option<&AtomicBool>,
+        mut on_status: S,
+        mut on_token: F,
+    ) -> Result<String>
+    where
+        S: FnMut(&str),
+        F: FnMut(&str) -> bool,
+    {
+        crate::hardware::lower_current_thread_priority(false);
+        self.sampler.temperature = temperature as f32;
+        self.sampler.top_p = top_p as f32;
+        let eos_ids = self.eos_token_ids();
+        let mut accumulated_answer = current_answer.to_string();
+
+        // Steg 1: Hvis modellen traff maks-tokens midt i en setning, la den først skrive ferdig
+        // den påbegynte tanken/setningen direkte fra eksisterende posisjon uten avbrudd.
+        if self.stopped_at_limit && looks_cut_off(&accumulated_answer) && self.pending_token.is_some()
+        {
+            on_status("Fullfører påbegynt setning (gjenbruker hurtigbuffer)...");
+            let mut tail_tokens: Vec<u32> = Vec::new();
+            let mut prev_len = 0usize;
+            let extra_budget = (max_tokens / 2).clamp(80, 260);
+
+            for step in 0..extra_budget {
+                let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
+                let Some(tok_to_feed) = self.pending_token.take() else {
+                    break;
+                };
+                let pos = self.current_pos;
+                let engine_ref = &mut self.engine;
+                let logits = self.governor.run_in_optimal_pool(snap.level, || {
+                    engine_ref.forward(&[tok_to_feed], pos, cancel_flag)
+                })?;
+                self.current_pos += 1;
+
+                let next_token = self.sampler.sample(&logits);
+                if eos_ids.contains(&next_token) {
+                    self.pending_token = None;
+                    break;
+                }
+                tail_tokens.push(next_token);
+                self.pending_token = Some(next_token);
+
+                if has_excessive_repetition(&tail_tokens) {
+                    break;
+                }
+
+                if let Ok(decoded) = self.tokenizer.decode(&tail_tokens, true) {
+                    if decoded.len() > prev_len {
+                        let piece = &decoded[prev_len..];
+                        accumulated_answer.push_str(piece);
+                        if !on_token(piece) {
+                            return Ok(accumulated_answer);
+                        }
+                        prev_len = decoded.len();
+                    }
+                }
+
+                if step >= 24 && !looks_cut_off(&accumulated_answer) {
+                    break;
+                }
+            }
+        }
+
+        // Steg 2: Inntil 2 runder med lynrask tilstandsbasert egenvurdering / fortsettelse
+        for round in 0..2 {
+            if round > 0 && !looks_cut_off(&accumulated_answer) {
+                break;
+            }
+
+            let is_cut = looks_cut_off(&accumulated_answer);
+            on_status(if is_cut {
+                "Svaret ble kuttet – fortsetter direkte fra hurtigbuffer..."
+            } else {
+                "Vurderer om svaret er godt nok..."
+            });
+
+            let turn_prompt = if is_cut {
+                if self.last_disable_thinking {
+                    "<|im_end|>\n<|im_start|>user\nSvaret ovenfor ble avbrutt før det var ferdig. Fortsett direkte der det sluttet, uten innledning og uten å gjenta noe.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                } else {
+                    "<|im_end|>\n<|im_start|>user\nSvaret ovenfor ble avbrutt før det var ferdig. Fortsett direkte der det sluttet, uten innledning og uten å gjenta noe.<|im_end|>\n<|im_start|>assistant\n"
+                }
+            } else if self.last_disable_thinking {
+                "<|im_end|>\n<|im_start|>user\nVurder svaret ditt ovenfor. Er spørsmålet godt nok og fullstendig besvart? Hvis det er godt nok, svar kun: GODT_NOK\nHvis noe viktig mangler, skriv kun selve fortsettelsen direkte på norsk uten å gjenta det som allerede er skrevet.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            } else {
+                "<|im_end|>\n<|im_start|>user\nVurder svaret ditt ovenfor. Er spørsmålet godt nok og fullstendig besvart? Hvis det er godt nok, svar kun: GODT_NOK\nHvis noe viktig mangler, skriv kun selve fortsettelsen direkte på norsk uten å gjenta det som allerede er skrevet.<|im_end|>\n<|im_start|>assistant\n"
+            };
+
+            let encoded = self
+                .tokenizer
+                .encode(turn_prompt, true)
+                .map_err(|e| anyhow!("Tokeniseringsfeil i vurdering: {}", e))?;
+            let mut turn_ids = encoded.get_ids().to_vec();
+            if let Some(im_end_id) = self.tokenizer.token_to_id("<|im_end|>") {
+                if turn_ids.len() >= 2 && turn_ids[0] != im_end_id && turn_ids[1] == im_end_id {
+                    turn_ids.remove(0);
+                }
+            }
+
+            let mut delta_tokens: Vec<u32> = Vec::with_capacity(turn_ids.len() + 1);
+            if let Some(unfed) = self.pending_token.take() {
+                delta_tokens.push(unfed);
+            }
+            delta_tokens.extend_from_slice(&turn_ids);
+
+            let logits = self.prefill_tokens_chunked(&delta_tokens, cancel_flag, &mut on_status)?;
+            let mut next_token = self.sampler.sample(&logits);
+            if eos_ids.contains(&next_token) {
+                self.pending_token = None;
+                break;
+            }
+
+            let mut round_tokens: Vec<u32> = vec![next_token];
+            self.pending_token = Some(next_token);
+            let mut prev_decoded_len = 0usize;
+            let mut eval_buffer = String::new();
+            let mut streaming_started = false;
+            let mut added_any_text = false;
+
+            let emit_separator = |acc: &mut String, cb: &mut F| -> bool {
+                if acc.is_empty() {
+                    return true;
+                }
+                let sep = if looks_cut_off(acc) {
+                    if acc.ends_with(char::is_whitespace) {
+                        ""
+                    } else {
+                        " "
+                    }
+                } else {
+                    "\n\n"
+                };
+                if !sep.is_empty() {
+                    acc.push_str(sep);
+                    return cb(sep);
+                }
+                true
+            };
+
+            if let Ok(decoded) = self.tokenizer.decode(&round_tokens, true) {
+                if decoded.len() > prev_decoded_len {
+                    eval_buffer.push_str(&decoded[prev_decoded_len..]);
+                    prev_decoded_len = decoded.len();
+                }
+            }
+
+            let round_budget = ((max_tokens * 3) / 4).max(160);
+            for _ in 0..round_budget.saturating_sub(1) {
+                if !streaming_started {
+                    match classify_eval_buffer(&eval_buffer) {
+                        EvalDecision::Complete => {
+                            self.pending_token = None;
+                            break;
+                        }
+                        EvalDecision::ContinueWith(cleaned) => {
+                            on_status("Utvider og fullfører svaret automatisk...");
+                            streaming_started = true;
+                            if !emit_separator(&mut accumulated_answer, &mut on_token) {
+                                return Ok(accumulated_answer);
+                            }
+                            accumulated_answer.push_str(&cleaned);
+                            added_any_text = true;
+                            if !on_token(&cleaned) {
+                                return Ok(accumulated_answer);
+                            }
+                        }
+                        EvalDecision::NeedMoreTokens => {}
+                    }
+                }
+
+                let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
+                if eos_ids.contains(&next_token) {
+                    self.pending_token = None;
+                    break;
+                }
+
+                let tok_to_feed = self.pending_token.take().unwrap_or(next_token);
+                let pos = self.current_pos;
+                let engine_ref = &mut self.engine;
+                let logits = self.governor.run_in_optimal_pool(snap.level, || {
+                    engine_ref.forward(&[tok_to_feed], pos, cancel_flag)
+                })?;
+                self.current_pos += 1;
+
+                next_token = self.sampler.sample(&logits);
+                if eos_ids.contains(&next_token) {
+                    self.pending_token = None;
+                    break;
+                }
+
+                round_tokens.push(next_token);
+                self.pending_token = Some(next_token);
+
+                if has_excessive_repetition(&round_tokens) {
+                    break;
+                }
+
+                if let Ok(decoded) = self.tokenizer.decode(&round_tokens, true) {
+                    if decoded.len() > prev_decoded_len {
+                        let piece = &decoded[prev_decoded_len..];
+                        prev_decoded_len = decoded.len();
+                        if streaming_started {
+                            accumulated_answer.push_str(piece);
+                            added_any_text = true;
+                            if !on_token(piece) {
+                                return Ok(accumulated_answer);
+                            }
+                        } else {
+                            eval_buffer.push_str(piece);
+                        }
+                    }
+                }
+            }
+
+            // Hvis runden ble ferdig før eval_buffer nådde terskelen (f.eks. en kort avsluttende setning),
+            // sørg for at vi tømmer bufferen til UI hvis det ikke var GODT_NOK!
+            if !streaming_started {
+                let cleaned = strip_continuation_prefix(&eval_buffer);
+                if !cleaned.is_empty() && ! matches!(classify_eval_buffer(&eval_buffer), EvalDecision::Complete) {
+                    let upper = cleaned.trim().to_uppercase();
+                    if !upper.starts_with("GODT_NOK") && !upper.starts_with("GODT NOK") {
+                        if !emit_separator(&mut accumulated_answer, &mut on_token) {
+                            return Ok(accumulated_answer);
+                        }
+                        accumulated_answer.push_str(cleaned);
+                        added_any_text = true;
+                        let _ = on_token(cleaned);
+                    }
+                }
+            }
+
+            if !added_any_text {
+                break;
+            }
+        }
+
+        Ok(accumulated_answer)
     }
 }
