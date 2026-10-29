@@ -1,0 +1,26 @@
+[package]
+name = "hf_local_assistant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.37", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sysinfo = "0.30"
+indicatif = "0.17"
+anyhow = "1.0"
+futures-util = "0.3"
+candle-core = "0.8"
+candle-transformers = "0.8"
+rayon = "1.10"
+tokenizers = "0.20"
+eframe = { version = "0.28", features = ["glow"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Dxgi",
+    "Win32_Foundation"
+] }
+
