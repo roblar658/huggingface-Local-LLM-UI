@@ -110,8 +110,9 @@ fn run_cli() -> Result<()> {
         println!("\nKlargjør inferensmotor...");
         let mut llm = inference::LocalLlm::load(&downloaded_path, &tokenizer_path)?;
 
+        let mut history: Vec<(String, String)> = Vec::new();
         loop {
-            print!("\nSkriv inn prompt (eller 'exit'): ");
+            print!("\nSkriv inn prompt (eller 'exit' for å avslutte, 'reset' for å nullstille chat): ");
             io::stdout().flush()?;
             let mut prompt = String::new();
             io::stdin().read_line(&mut prompt)?;
@@ -120,9 +121,45 @@ fn run_cli() -> Result<()> {
             if prompt == "exit" {
                 break;
             }
+            if prompt == "reset" {
+                history.clear();
+                println!("Samtalehistorikk er nullstilt.");
+                continue;
+            }
+            if prompt.is_empty() {
+                continue;
+            }
+
+            let mut parts: Vec<String> = Vec::new();
+            for (sender, text) in &history {
+                if sender == "Du" {
+                    parts.push(format!("[bruker] {}", text));
+                } else if sender == "Modell" {
+                    parts.push(format!("[AI] {}", text));
+                }
+            }
+            parts.push(format!("[bruker] {}", prompt));
+            let full_prompt = parts.join(" ");
+
+            let sys_prompt = "Du er en ekstremt kortfattet assistent. Svar kun med selve svaret på norsk i maksimalt 1–2 korte setninger uten innledning. Om ikke mulig, øk antall setninger med 1 inntil det gir mening. Samtalehistorikk og kontekst er strukturert kronologisk der [bruker] angir meldinger fra brukeren og [AI] angir svar fra assistenten, adskilt med mellomrom. Tolk denne konteksten og svar som [AI] på den siste [bruker]-meldingen.";
 
             println!("\nGenererer svar...");
-            llm.generate(prompt, 200)?;
+            let ans = llm.generate_with_callback(
+                sys_prompt,
+                true,
+                &full_prompt,
+                200,
+                0.7,
+                0.9,
+                None,
+                |tok| {
+                    print!("{}", tok);
+                    let _ = io::stdout().flush();
+                    true
+                },
+            )?;
+            history.push(("Du".to_string(), prompt.to_string()));
+            history.push(("Modell".to_string(), ans));
         }
 
         Ok(())

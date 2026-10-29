@@ -73,6 +73,7 @@ pub struct HfAssistantApp {
     temperature: f32,
     top_p: f32,
     max_tokens: usize,
+    use_context: bool,
     is_generating: bool,
     cancel_flag: Arc<AtomicBool>,
 }
@@ -118,6 +119,7 @@ impl HfAssistantApp {
             temperature: 0.7,
             top_p: 0.9,
             max_tokens: 250,
+            use_context: true,
             is_generating: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
         };
@@ -252,7 +254,37 @@ impl HfAssistantApp {
 
         self.cancel_flag.store(false, Ordering::SeqCst);
 
-        self.chat_history.push(("Du".to_string(), prompt.clone()));
+        // Bygg prompt og system-prompt med eller uten kontekst
+        let (prompt_to_send, sys_to_send) = if self.use_context {
+            let mut parts: Vec<String> = Vec::new();
+            for (sender, text) in &self.chat_history {
+                let t = text.trim();
+                if t.is_empty() || t == "[Avbrutt av bruker]" || sender == "System" {
+                    continue;
+                }
+                if sender == "Du" {
+                    parts.push(format!("[bruker] {}", t));
+                } else if sender == "Modell" {
+                    parts.push(format!("[AI] {}", t));
+                }
+            }
+            parts.push(format!("[bruker] {}", prompt));
+            let full_prompt = parts.join(" ");
+
+            let context_instruction = "Samtalehistorikk og kontekst er strukturert kronologisk der [bruker] angir meldinger fra brukeren og [AI] angir svar fra assistenten, adskilt med mellomrom. Tolk denne konteksten og svar som [AI] på den siste [bruker]-meldingen.";
+            let base_sys = self.system_prompt.trim();
+            let full_sys = if base_sys.is_empty() {
+                context_instruction.to_string()
+            } else {
+                format!("{} {}", base_sys, context_instruction)
+            };
+
+            (full_prompt, full_sys)
+        } else {
+            (prompt.clone(), self.system_prompt.clone())
+        };
+
+        self.chat_history.push(("Du".to_string(), prompt));
         self.chat_history.push(("Modell".to_string(), String::new()));
         self.current_prompt.clear();
         self.is_generating = true;
@@ -263,7 +295,7 @@ impl HfAssistantApp {
         let max_toks = self.max_tokens;
         let temp = self.temperature as f64;
         let p = self.top_p as f64;
-        let sys_prompt = self.system_prompt.clone();
+        let sys_prompt = sys_to_send;
         let disable_think = self.disable_thinking_tags;
         let cancel_arc = self.cancel_flag.clone();
 
@@ -275,7 +307,7 @@ impl HfAssistantApp {
                 let res = llm.generate_with_callback(
                     &sys_prompt,
                     disable_think,
-                    &prompt,
+                    &prompt_to_send,
                     max_toks,
                     temp,
                     p,
@@ -829,6 +861,18 @@ impl HfAssistantApp {
             {
                 self.system_prompt_approved = false;
             }
+            if ui
+                .checkbox(
+                    &mut self.use_context,
+                    egui::RichText::new(
+                        "Bruk samtalekontekst (append meldinger med [bruker] og [AI] samt tolkningsinstruks)",
+                    )
+                    .color(egui::Color32::from_gray(230)),
+                )
+                .changed()
+            {
+                self.system_prompt_approved = false;
+            }
         });
 
         ui.add_space(6.0);
@@ -871,6 +915,17 @@ impl HfAssistantApp {
                         "Deaktivert (gir raskest mulig svar)"
                     } else {
                         "Aktivert (modellen tenker høyt før svaret)"
+                    }
+                ),
+            );
+            ui.colored_label(
+                egui::Color32::from_gray(230),
+                format!(
+                    "• Samtalekontekst: {}",
+                    if self.use_context {
+                        "Aktivert (appendes med mellomrom, [bruker] og [AI] + instruks i prompt)"
+                    } else {
+                        "Deaktivert (enkelt-forespørsler uten historikk)"
                     }
                 ),
             );
@@ -994,7 +1049,26 @@ impl HfAssistantApp {
             ui.add(egui::Slider::new(&mut self.temperature, 0.1..=1.5));
             ui.colored_label(egui::Color32::WHITE, "Max Tokens:");
             ui.add(egui::Slider::new(&mut self.max_tokens, 50..=1000));
+            ui.checkbox(
+                &mut self.use_context,
+                egui::RichText::new("Bruk kontekst").color(egui::Color32::WHITE),
+            )
+            .on_hover_text(
+                "Inkluderer tidligere meldinger formatert med [bruker] og [AI] adskilt med mellomrom samt instruksjon i System Prompt.",
+            );
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .button(egui::RichText::new("🗑️ Nullstill chat").color(egui::Color32::WHITE))
+                    .on_hover_text("Tømmer samtalehistorikken og starter på nytt.")
+                    .clicked()
+                {
+                    if self.is_generating {
+                        self.cancel_generation();
+                    }
+                    self.chat_history.clear();
+                    self.status_msg = "Samtalehistorikk er nullstilt.".to_string();
+                }
                 if ui.button("⚙️ System Prompt").clicked() {
                     self.active_tab = ActiveTab::SystemPrompt;
                 }

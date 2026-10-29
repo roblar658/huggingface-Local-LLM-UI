@@ -47,7 +47,9 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
   - Lokal filoversikt med status for nedlastede vekter og tokenizere.
   - Dedikert fane for vurdering, justering og forhåndsgodkjenning av systeminstruksjoner (System Prompt).
   - Samtalepanel med høykontrast-tekst, justerbare inferensparametere og avbryt-funksjon.
-- **Kommandolinjegrensesnitt (CLI)**: Støtte for ren terminalbasert interaksjon via flagget `--cli`.
+  - Samtalekontekst med støtte for fler-stegs samtaler formatert kronologisk med `[bruker]` og `[AI]` adskilt med mellomrom, samt tilhørende tolkningsinstruks i System Prompt.
+  - Egen funksjon for øyeblikkelig nullstilling av samtalelogg (Reset chat).
+- **Kommandolinjegrensesnitt (CLI)**: Støtte for ren terminalbasert interaksjon via flagget `--cli` med støtte for samtalehistorikk og `reset`-kommando.
 
 ---
 
