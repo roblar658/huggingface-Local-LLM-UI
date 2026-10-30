@@ -2892,6 +2892,7 @@ pub struct LocalLlm {
     stopped_at_limit: bool,
     last_disable_thinking: bool,
     governor: std::sync::Arc<crate::hardware::ResourceGovernor>,
+    last_dynamic_adjust: std::time::Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3050,7 +3051,20 @@ impl LocalLlm {
             stopped_at_limit: false,
             last_disable_thinking: true,
             governor,
+            last_dynamic_adjust: std::time::Instant::now() - std::time::Duration::from_secs(10),
         })
+    }
+
+    fn check_and_adjust_placement(&mut self, snap: &crate::hardware::ResourceSnapshot) -> Option<String> {
+        if self.last_dynamic_adjust.elapsed() >= std::time::Duration::from_secs(4) {
+            let res = self.engine.dynamically_adjust_placement(snap);
+            if res.is_some() {
+                self.last_dynamic_adjust = std::time::Instant::now();
+            }
+            res
+        } else {
+            None
+        }
     }
 
     pub fn get_hybrid_status(&self) -> HybridStatus {
@@ -3100,7 +3114,7 @@ impl LocalLlm {
         let mut last_logits = Vec::new();
         while offset < tokens.len() {
             let snap = self.governor.pace_and_recover(cancel_flag, &mut *on_status)?;
-            if let Some(msg) = self.engine.dynamically_adjust_placement(&snap) {
+            if let Some(msg) = self.check_and_adjust_placement(&snap) {
                 on_status(&msg);
             }
             let chunk_size = snap.prefill_chunk_size.max(1);
@@ -3250,7 +3264,7 @@ impl LocalLlm {
 
         for _ in 0..max_tokens.saturating_sub(1) {
             let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
-            if let Some(msg) = self.engine.dynamically_adjust_placement(&snap) {
+            if let Some(msg) = self.check_and_adjust_placement(&snap) {
                 on_status(&msg);
             }
             if eos_ids.contains(&next_token) {
@@ -3334,7 +3348,7 @@ impl LocalLlm {
 
             for step in 0..extra_budget {
                 let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
-                if let Some(msg) = self.engine.dynamically_adjust_placement(&snap) {
+                if let Some(msg) = self.check_and_adjust_placement(&snap) {
                     on_status(&msg);
                 }
                 let Some(tok_to_feed) = self.pending_token.take() else {

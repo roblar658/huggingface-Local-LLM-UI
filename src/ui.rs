@@ -77,6 +77,7 @@ pub struct HfAssistantApp {
 
     // Chat / Prompting
     loaded_llm: Arc<Mutex<Option<LocalLlm>>>,
+    cached_hybrid_status: Option<crate::inference::HybridStatus>,
     selected_llm_path: Option<PathBuf>,
     is_loading_llm: bool,
     chat_history: Vec<(String, String)>, // (sender, text)
@@ -132,6 +133,7 @@ impl HfAssistantApp {
             system_prompt_approved: false,
 
             loaded_llm: Arc::new(Mutex::new(None)),
+            cached_hybrid_status: None,
             selected_llm_path: None,
             is_loading_llm: false,
             chat_history: Vec::new(),
@@ -547,10 +549,31 @@ impl HfAssistantApp {
     }
 }
 
+fn get_animated_hourglass(ctx: &egui::Context) -> &'static str {
+    let time = ctx.input(|i| i.time);
+    let step = ((time * 2.8) as usize) % 4;
+    match step {
+        0 => "⏳",
+        1 => "⌛",
+        2 => "⏳",
+        _ => "⌛",
+    }
+}
+
 impl eframe::App for HfAssistantApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let is_focused = ctx.input(|i| i.focused);
         self.resource_governor.set_app_focused(is_focused);
+
+        // Hent modellstatus ikke-blokkerende så UI-tråden aldri låser seg under inferens
+        if let Ok(guard) = self.loaded_llm.try_lock() {
+            if let Some(ref model) = *guard {
+                self.cached_hybrid_status = Some(model.get_hybrid_status());
+            } else {
+                self.cached_hybrid_status = None;
+            }
+        }
+
         if self.last_resource_refresh.elapsed() >= std::time::Duration::from_millis(600) {
             self.resource_snapshot = self.resource_governor.sample();
             self.last_resource_refresh = std::time::Instant::now();
@@ -778,23 +801,20 @@ impl eframe::App for HfAssistantApp {
                             .color(egui::Color32::from_rgb(50, 220, 100)),
                         );
                         ui.separator();
-                        if let Ok(guard) = self.loaded_llm.lock() {
-                            if let Some(ref model) = *guard {
-                                let st = model.get_hybrid_status();
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "⚡ {}",
-                                        st.summary()
-                                    ))
-                                    .color(if st.gpu_layers == st.total_layers && st.total_layers > 0 {
-                                        egui::Color32::from_rgb(50, 220, 100)
-                                    } else {
-                                        egui::Color32::from_rgb(240, 200, 50)
-                                    })
-                                    .strong(),
-                                );
-                                ui.separator();
-                            }
+                        if let Some(ref st) = self.cached_hybrid_status {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "⚡ {}",
+                                    st.summary()
+                                ))
+                                .color(if st.gpu_layers == st.total_layers && st.total_layers > 0 {
+                                    egui::Color32::from_rgb(50, 220, 100)
+                                } else {
+                                    egui::Color32::from_rgb(240, 200, 50)
+                                })
+                                .strong(),
+                            );
+                            ui.separator();
                         }
                         let badge_color = match self.resource_snapshot.level {
                             ResourceLevel::OptimalSubMax => egui::Color32::from_rgb(80, 210, 255),
@@ -863,7 +883,15 @@ impl eframe::App for HfAssistantApp {
             }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Status:").strong());
-                ui.label(&self.status_msg);
+                if self.is_generating {
+                    let hourglass = get_animated_hourglass(ui.ctx());
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 215, 0),
+                        format!("{} {}", hourglass, self.status_msg),
+                    );
+                } else {
+                    ui.label(&self.status_msg);
+                }
             });
             ui.add_space(4.0);
         });
@@ -1436,19 +1464,16 @@ impl HfAssistantApp {
                         p.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
-                if let Ok(guard) = self.loaded_llm.lock() {
-                    if let Some(ref model) = *guard {
-                        let st = model.get_hybrid_status();
-                        let badge_color = if st.gpu_layers == st.total_layers && st.total_layers > 0 {
-                            egui::Color32::from_rgb(50, 220, 100)
-                        } else {
-                            egui::Color32::from_rgb(240, 200, 50)
-                        };
-                        ui.colored_label(
-                            badge_color,
-                            format!("— {}", st.summary()),
-                        );
-                    }
+                if let Some(ref st) = self.cached_hybrid_status {
+                    let badge_color = if st.gpu_layers == st.total_layers && st.total_layers > 0 {
+                        egui::Color32::from_rgb(50, 220, 100)
+                    } else {
+                        egui::Color32::from_rgb(240, 200, 50)
+                    };
+                    ui.colored_label(
+                        badge_color,
+                        format!("— {}", st.summary()),
+                    );
                 }
             } else {
                 ui.colored_label(
@@ -1532,11 +1557,15 @@ impl HfAssistantApp {
         let row_height = ui.text_style_height(&text_style);
         let num_rows = self.chat_history.len();
 
+        let hourglass = get_animated_hourglass(ui.ctx());
+
         egui::ScrollArea::vertical()
             .max_height(430.0)
             .stick_to_bottom(true)
             .show_rows(ui, row_height, num_rows, |ui, _row_range| {
-                for (sender, msg) in &self.chat_history {
+                let total = self.chat_history.len();
+                for (idx, (sender, msg)) in self.chat_history.iter().enumerate() {
+                    let is_last = idx == total.saturating_sub(1);
                     ui.group(|ui| {
                         if sender == "Du" {
                             ui.colored_label(
@@ -1549,13 +1578,30 @@ impl HfAssistantApp {
                                 format!("ℹ️ {}:", sender),
                             );
                         } else {
+                            let label_header = if is_last && self.is_generating {
+                                format!("🤖 {} {} (Genererer...)", sender, hourglass)
+                            } else {
+                                format!("🤖 {}:", sender)
+                            };
                             ui.colored_label(
                                 egui::Color32::from_rgb(100, 255, 150),
-                                format!("🤖 {}:", sender),
+                                label_header,
                             );
                         }
-                        // Lysere, ren hvit tekst for høy kontrast i chat
-                        ui.colored_label(egui::Color32::WHITE, msg);
+                        // Lysere, ren hvit tekst for høy kontrast i chat, med timeglass-symbol når den tenker
+                        if is_last && self.is_generating && msg.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 215, 0),
+                                format!("{} Tenker og gjør klar svar...", hourglass),
+                            );
+                        } else if is_last && self.is_generating {
+                            ui.colored_label(
+                                egui::Color32::WHITE,
+                                format!("{} {}", msg, hourglass),
+                            );
+                        } else {
+                            ui.colored_label(egui::Color32::WHITE, msg);
+                        }
                     });
                     ui.add_space(4.0);
                 }
@@ -1617,15 +1663,22 @@ impl HfAssistantApp {
         }
 
         ui.horizontal(|ui| {
-            let mut right_reserve = if self.is_generating { 115.0 } else { 80.0 };
+            let mut right_reserve = if self.is_generating { 145.0 } else { 80.0 };
             if self.enable_ocr_paste {
                 right_reserve += 175.0;
             }
+
+            let prompt_hint = if self.is_generating {
+                format!("{} Modellen tenker... Vent litt eller trykk [⏹ Avbryt]", hourglass)
+            } else {
+                "Skriv melding... (eller lim inn bilder med Ctrl+V)".to_string()
+            };
+
             let response = ui.add_sized(
                 [ui.available_width() - right_reserve, if self.current_prompt.contains('\n') { 70.0 } else { 34.0 }],
                 egui::TextEdit::multiline(&mut self.current_prompt)
                     .text_color(egui::Color32::WHITE)
-                    .hint_text("Skriv melding... (eller lim inn bilder med Ctrl+V)"),
+                    .hint_text(prompt_hint),
             );
 
             if response.lost_focus()
@@ -1649,7 +1702,10 @@ impl HfAssistantApp {
             }
 
             if self.is_generating {
-                ui.spinner();
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 215, 0),
+                    egui::RichText::new(format!("{} Venter", hourglass)).strong(),
+                );
                 if ui.button("⏹ Avbryt").clicked() {
                     self.cancel_generation();
                 }

@@ -144,6 +144,7 @@ pub struct ResourceGovernor {
     pool_low: rayon::ThreadPool,
     pool_minimal: rayon::ThreadPool,
     last_pause: std::sync::Mutex<std::time::Instant>,
+    last_sample: std::sync::Mutex<Option<(std::time::Instant, ResourceSnapshot)>>,
 }
 
 impl ResourceGovernor {
@@ -200,6 +201,22 @@ impl ResourceGovernor {
             last_pause: std::sync::Mutex::new(
                 std::time::Instant::now() - std::time::Duration::from_secs(10),
             ),
+            last_sample: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn sample_cached(&self, min_interval: std::time::Duration) -> ResourceSnapshot {
+        if let Ok(mut guard) = self.last_sample.lock() {
+            if let Some((inst, ref snap)) = *guard {
+                if inst.elapsed() < min_interval {
+                    return *snap;
+                }
+            }
+            let fresh = self.sample();
+            *guard = Some((std::time::Instant::now(), fresh));
+            fresh
+        } else {
+            self.sample()
         }
     }
 
@@ -321,11 +338,10 @@ impl ResourceGovernor {
             }
         }
 
-        let mut snap = self.sample();
+        let mut snap = self.sample_cached(std::time::Duration::from_millis(150));
 
         match snap.level {
             ResourceLevel::CriticalPause => {
-                trim_process_working_set();
                 let should_pause = if let Ok(mut last) = self.last_pause.lock() {
                     if last.elapsed() >= std::time::Duration::from_secs(4) {
                         *last = std::time::Instant::now();
@@ -338,18 +354,19 @@ impl ResourceGovernor {
                 };
                 if should_pause {
                     on_status(&format!(
-                        "Frigjør systemminne ({} MB RAM ledig) – fortsetter i skånsom modus...",
+                        "Skånsom modus ({} MB RAM ledig) – gir systemet pusterom...",
                         snap.avail_phys_mb
                     ));
-                    std::thread::sleep(std::time::Duration::from_millis(220));
+                    std::thread::sleep(std::time::Duration::from_millis(120));
                     snap = self.sample();
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(snap.throttle_sleep_ms));
                 }
             }
             ResourceLevel::LowResources => {
-                trim_process_working_set();
-                std::thread::sleep(std::time::Duration::from_millis(snap.throttle_sleep_ms));
+                if snap.throttle_sleep_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(snap.throttle_sleep_ms));
+                }
             }
             ResourceLevel::Balanced => {
                 if snap.throttle_sleep_ms > 0 {
