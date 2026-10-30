@@ -1,11 +1,10 @@
 use crate::hardware::HardwareSpec;
 use crate::hf_client::HfModel;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FitLevel {
     FullGpuOffload,
-    HybridGpuCpu,
-    CpuRamFallback,
+    PartialGpuRam,
     TooLarge,
 }
 
@@ -59,14 +58,19 @@ pub fn assess_model(model: &HfModel, hardware: &HardwareSpec) -> ModelAssessment
 
     let (param_str, req_gb) = found.unwrap_or(("7B (antatt)", 5.5));
 
-    let fit_level = if hardware.dedicated_vram_gb >= req_gb + 0.5 {
+    // Trygg VRAM-margin (trekker fra minst 1.6 GB reservert for Windows DWM og andre apper)
+    let safe_vram = (hardware.dedicated_vram_gb - 1.6).max(0.0);
+    // Effektivt tilgjengelig RAM for modellvekter (minst ledig RAM, men tar også høyde for dynamisk frigjøring)
+    let effective_ram = hardware.available_ram_gb.max(hardware.total_ram_gb * 0.7);
+    let safe_ram = (effective_ram - 2.0).max(0.0);
+    let combined_safe = safe_vram + safe_ram;
+
+    let fit_level = if safe_vram >= req_gb + 0.3 {
+        // Kan gis grønn: Modellen passer 100% i dedikert GPU VRAM med trygg margin
         FitLevel::FullGpuOffload
-    } else if hardware.dedicated_vram_gb >= 2.0
-        && (hardware.dedicated_vram_gb + hardware.available_ram_gb >= req_gb + 1.0)
-    {
-        FitLevel::HybridGpuCpu
-    } else if hardware.available_ram_gb >= req_gb + 1.0 {
-        FitLevel::CpuRamFallback
+    } else if combined_safe >= req_gb + 0.5 {
+        // Kan ikke gis grønn, men er mulig med nåværende RAM + VRAM og vil faktisk fungere (Partiell)
+        FitLevel::PartialGpuRam
     } else {
         FitLevel::TooLarge
     };

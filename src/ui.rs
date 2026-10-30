@@ -766,8 +766,6 @@ impl eframe::App for HfAssistantApp {
                                     ))
                                     .color(if st.gpu_layers == st.total_layers && st.total_layers > 0 {
                                         egui::Color32::from_rgb(50, 220, 100)
-                                    } else if st.gpu_layers > 0 {
-                                        egui::Color32::from_rgb(80, 210, 255)
                                     } else {
                                         egui::Color32::from_rgb(240, 200, 50)
                                     })
@@ -917,12 +915,8 @@ impl HfAssistantApp {
                                             "🟢 Rask (Full GPU VRAM)",
                                             egui::Color32::from_rgb(50, 220, 100),
                                         ),
-                                        FitLevel::HybridGpuCpu => (
-                                            "⚡ Hybrid (Delvis GPU + CPU)",
-                                            egui::Color32::from_rgb(80, 210, 255),
-                                        ),
-                                        FitLevel::CpuRamFallback => (
-                                            "🟡 Medium (System-RAM / CPU)",
+                                        FitLevel::PartialGpuRam => (
+                                            "🟡 Partiell (Delvis GPU + RAM)",
                                             egui::Color32::from_rgb(240, 200, 50),
                                         ),
                                         FitLevel::TooLarge => (
@@ -1310,8 +1304,13 @@ impl HfAssistantApp {
                 if let Ok(guard) = self.loaded_llm.lock() {
                     if let Some(ref model) = *guard {
                         let st = model.get_hybrid_status();
+                        let badge_color = if st.gpu_layers == st.total_layers && st.total_layers > 0 {
+                            egui::Color32::from_rgb(50, 220, 100)
+                        } else {
+                            egui::Color32::from_rgb(240, 200, 50)
+                        };
                         ui.colored_label(
-                            egui::Color32::from_rgb(80, 210, 255),
+                            badge_color,
                             format!("— {}", st.summary()),
                         );
                     }

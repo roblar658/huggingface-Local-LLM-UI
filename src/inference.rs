@@ -537,11 +537,11 @@ impl HybridStatus {
             format!("Full GPU (alle {}/{} lag i VRAM: {:.2} GB)", self.gpu_layers, self.total_layers, vram_gb)
         } else if self.gpu_layers > 0 {
             format!(
-                "Hybrid GPU+CPU (dynamisk): {}/{} lag i GPU ({:.2} GB VRAM) + {} lag på CPU",
+                "Partiell ({} / {} lag i GPU [{:.2} GB VRAM] + {} lag i RAM - dynamisk)",
                 self.gpu_layers, self.total_layers, vram_gb, self.cpu_layers
             )
         } else {
-            format!("Ren CPU (alle {} lag i systemminne via AVX2+FMA)", self.total_layers)
+            format!("Partiell / CPU (alle {} lag i RAM via AVX2+FMA)", self.total_layers)
         }
     }
 }
