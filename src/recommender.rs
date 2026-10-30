@@ -16,7 +16,7 @@ pub struct ModelAssessment {
     pub fit_level: FitLevel,
 }
 
-/// Finner parameter-størrelse (f.eks. 397B, 70B, 35B, 27B, 14B, 9B, 8B, 7B, 3B, 1.5B)
+/// Finner parameter-størrelse (f.eks. 397B, 70B, 35B, 27B, 14B, 9B, 8B, 7B, 3B, 1.5B, 0.5B, 135M)
 /// ved å sjekke separate ord/tokens i modellnavnet slik at "27b" ikke feiltolkes som "7b".
 pub fn assess_model(model: &HfModel, hardware: &HardwareSpec) -> ModelAssessment {
     let id_lower = model.id.to_lowercase();
@@ -47,10 +47,20 @@ pub fn assess_model(model: &HfModel, hardware: &HardwareSpec) -> ModelAssessment
                     "7B/8B"
                 } else if params >= 2.5 {
                     "3B"
-                } else {
+                } else if params >= 1.8 {
+                    "2B/3B"
+                } else if params >= 0.8 {
                     "1B/1.5B"
+                } else {
+                    "<1B"
                 };
                 found = Some((label, req_gb));
+                break;
+            }
+        } else if let Some(num_str) = t.strip_suffix('m') {
+            if let Ok(params_m) = num_str.parse::<f64>() {
+                let req_gb: f64 = (params_m * 0.001 * 0.75).max(0.5);
+                found = Some(("<1B", req_gb));
                 break;
             }
         }

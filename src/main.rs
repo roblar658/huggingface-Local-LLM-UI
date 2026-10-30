@@ -60,7 +60,7 @@ fn run_cli() -> Result<()> {
 
         println!("Henter åpne GGUF-modeller fra Hugging Face (høflig API-tilgang)...");
         let client = HfPoliteClient::new();
-        let models = client.list_open_gguf_models(10).await?;
+        let models = client.list_open_gguf_models(50).await?;
 
         println!("\nAnbefalte modeller for din maskinvare:");
         println!("{:<4} {:<40} {:<10} {:<20}", "Nr", "Modell ID", "Størrelse", "Kjøringsmodus");

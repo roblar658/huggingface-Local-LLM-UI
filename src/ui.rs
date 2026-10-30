@@ -3,7 +3,7 @@ use crate::hf_client::{HfModel, HfPoliteClient};
 use crate::inference::LocalLlm;
 use crate::recommender::{assess_model, FitLevel};
 use eframe::egui;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -199,7 +199,22 @@ impl HfAssistantApp {
         let tx = self.event_tx.clone();
         self.tokio_handle.spawn(async move {
             let client = HfPoliteClient::new();
-            match client.list_open_gguf_models(20).await {
+            match client.list_open_gguf_models(120).await {
+                Ok(models) => {
+                    let _ = tx.send(AppEvent::ModelsLoaded(Ok(models)));
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::ModelsLoaded(Err(e.to_string())));
+                }
+            }
+        });
+    }
+
+    fn search_hf_hub(&self, query: String) {
+        let tx = self.event_tx.clone();
+        self.tokio_handle.spawn(async move {
+            let client = HfPoliteClient::new();
+            match client.search_open_gguf_models(&query, 60).await {
                 Ok(models) => {
                     let _ = tx.send(AppEvent::ModelsLoaded(Ok(models)));
                 }
@@ -566,11 +581,18 @@ impl eframe::App for HfAssistantApp {
                     self.is_loading_models = false;
                     match res {
                         Ok(list) => {
+                            let mut added = 0;
+                            for m in list {
+                                if !self.models.iter().any(|existing| existing.id == m.id) {
+                                    self.models.push(m);
+                                    added += 1;
+                                }
+                            }
                             self.status_msg = format!(
-                                "Fant {} åpne GGUF-modeller fra Hugging Face.",
-                                list.len()
+                                "Modelliste oppdatert: {} modeller tilgjengelig ({} nye lagt til).",
+                                self.models.len(),
+                                added
                             );
-                            self.models = list;
                         }
                         Err(err) => {
                             self.status_msg = format!("Feil ved henting av modeller: {}", err);
@@ -863,12 +885,115 @@ impl eframe::App for HfAssistantApp {
 
 impl HfAssistantApp {
     fn render_explore_tab(&mut self, ui: &mut egui::Ui) {
+        let mut do_hub_search = false;
+
         ui.horizontal(|ui| {
             ui.label("🔎 Søk:");
-            ui.text_edit_singleline(&mut self.filter_search);
+            let resp = ui.text_edit_singleline(&mut self.filter_search);
+            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                do_hub_search = true;
+            }
+
+            if ui.button("🌐 Søk på HF Hub").clicked() {
+                do_hub_search = true;
+            }
+
+            if ui.button("🔄 Topp 120").clicked() {
+                self.is_loading_models = true;
+                self.fetch_hf_models();
+            }
+
             ui.checkbox(
                 &mut self.filter_only_fitting,
                 "Vis kun modeller som passer min PC",
+            );
+        });
+
+        if do_hub_search && !self.filter_search.trim().is_empty() {
+            self.is_loading_models = true;
+            self.search_hf_hub(self.filter_search.clone());
+        }
+
+        ui.add_space(4.0);
+
+        // Kategori-knapper / Hurtigfiltre
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Hurtigvalg:");
+            if ui.small_button("Alle").clicked() {
+                self.filter_search.clear();
+            }
+            if ui.small_button("⚡ 1B - 3B").clicked() {
+                self.filter_search = "3b".to_string();
+            }
+            if ui.small_button("🔥 7B - 9B").clicked() {
+                self.filter_search = "7b".to_string();
+            }
+            if ui.small_button("🚀 14B - 32B").clicked() {
+                self.filter_search = "14b".to_string();
+            }
+            if ui.small_button("🧠 DeepSeek / R1").clicked() {
+                self.filter_search = "DeepSeek".to_string();
+            }
+            if ui.small_button("💻 Coder").clicked() {
+                self.filter_search = "Coder".to_string();
+            }
+            if ui.small_button("✨ Qwen 2.5").clicked() {
+                self.filter_search = "Qwen2.5".to_string();
+            }
+            if ui.small_button("🦙 Llama 3").clicked() {
+                self.filter_search = "Llama-3".to_string();
+            }
+            if ui.small_button("💎 Gemma 2").clicked() {
+                self.filter_search = "gemma".to_string();
+            }
+            if ui.small_button("🌪️ Mistral").clicked() {
+                self.filter_search = "Mistral".to_string();
+            }
+
+            if self.is_loading_models {
+                ui.separator();
+                ui.spinner();
+                ui.colored_label(
+                    egui::Color32::from_rgb(0, 180, 255),
+                    "Henter modeller fra Hugging Face...",
+                );
+            }
+        });
+
+        let hw_opt = self.hardware.clone();
+        let visible_count = self
+            .models
+            .iter()
+            .filter(|m| {
+                if !self.filter_search.is_empty()
+                    && !m
+                        .id
+                        .to_lowercase()
+                        .contains(&self.filter_search.to_lowercase())
+                {
+                    return false;
+                }
+                if self.filter_only_fitting {
+                    if let Some(ref hw) = hw_opt {
+                        let a = assess_model(m, hw);
+                        if matches!(a.fit_level, FitLevel::TooLarge) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .count();
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(format!(
+                    "Viser {} av {} tilgjengelige modeller",
+                    visible_count,
+                    self.models.len()
+                ))
+                .weak(),
             );
         });
 
@@ -926,6 +1051,16 @@ impl HfAssistantApp {
                                     };
                                     ui.colored_label(color, text);
                                     ui.label(format!("(Est. {})", a.est_param_size));
+                                }
+                                if let Some(dl) = m.downloads {
+                                    let dl_str = if dl >= 1_000_000 {
+                                        format!("{:.1}M", dl as f64 / 1_000_000.0)
+                                    } else if dl >= 1_000 {
+                                        format!("{:.0}k", dl as f64 / 1_000.0)
+                                    } else {
+                                        format!("{}", dl)
+                                    };
+                                    ui.label(format!("• ⬇ {}", dl_str));
                                 }
                             });
                         });
