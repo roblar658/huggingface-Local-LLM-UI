@@ -53,6 +53,10 @@
       <Component Id="LibWinPthread" Guid="C19519BC-25DE-4841-A89E-4BC3058D4DE4">
         <File Id="LibWinPthreadDll" Source="..\target\release\libwinpthread-1.dll" KeyPath="yes" />
       </Component>
+
+      <Component Id="LicenseFile" Guid="A781878B-8228-4DE3-A337-E682BE9DEE67">
+        <File Id="LicenseRtfFile" Source="License.rtf" KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
     <ComponentGroup Id="ToolComponents" Directory="ToolsFolder">
@@ -73,6 +77,7 @@
     </Feature>
 
     <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
   </Package>
 </Wix>
 
