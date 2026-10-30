@@ -1,10 +1,10 @@
 # Hugging Face Local Assistant
 
 En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GGUF-språkmodeller med en egenutviklet GPU- og CPU-inferensmotor (CUDA Driver API PTX-kjerner og AVX2/FMA SIMD), minnekartlegging og dynamisk ressursstyring.
-
+<img width="956" height="533" alt="image" src="https://github.com/user-attachments/assets/4f94dae6-9173-4d60-b359-f49551d5b650" />
 <img width="957" height="545" alt="image" src="https://github.com/user-attachments/assets/921df855-9dfc-40ee-9b9a-735c6f3c4573" />
-<img width="956" height="536" alt="image" src="https://github.com/user-attachments/assets/8ceb6532-02de-437f-a3f5-a36627cdbdc6" />
-<img width="957" height="526" alt="image" src="https://github.com/user-attachments/assets/d9086947-ecf9-47a9-bc20-bcd3083200a7" />
+<img width="956" height="539" alt="image" src="https://github.com/user-attachments/assets/2c9e66d1-6070-45bc-a674-45c5f1725e20" />
+<img width="950" height="543" alt="image" src="https://github.com/user-attachments/assets/a1a452cd-6644-4281-86fe-008c4cd65551" />
 <img width="959" height="542" alt="image" src="https://github.com/user-attachments/assets/e29af3ef-d758-4f42-a0ac-2549dc08b4c8" />
 
 
