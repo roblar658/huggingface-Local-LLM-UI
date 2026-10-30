@@ -5,7 +5,8 @@ En Windows-applikasjon i Rust for utforsking, nedlasting og lokal kjøring av GG
 <img width="957" height="545" alt="image" src="https://github.com/user-attachments/assets/921df855-9dfc-40ee-9b9a-735c6f3c4573" />
 <img width="956" height="536" alt="image" src="https://github.com/user-attachments/assets/8ceb6532-02de-437f-a3f5-a36627cdbdc6" />
 <img width="957" height="526" alt="image" src="https://github.com/user-attachments/assets/d9086947-ecf9-47a9-bc20-bcd3083200a7" />
-<img width="959" height="539" alt="image" src="https://github.com/user-attachments/assets/b4eb4f28-3999-4c4c-8e9e-17a18a5c2453" />
+<img width="959" height="542" alt="image" src="https://github.com/user-attachments/assets/e29af3ef-d758-4f42-a0ac-2549dc08b4c8" />
+
 
 
 
