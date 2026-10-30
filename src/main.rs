@@ -71,6 +71,7 @@ fn run_cli() -> Result<()> {
             let assessment = assess_model(m, &hw);
             let fit_desc = match assessment.fit_level {
                 FitLevel::FullGpuOffload => "Rask (Full GPU VRAM)",
+                FitLevel::HybridGpuCpu => "Hybrid (Delvis GPU + CPU)",
                 FitLevel::CpuRamFallback => "Medium (System-RAM / CPU)",
                 FitLevel::TooLarge => "For stor for PC-en",
             };

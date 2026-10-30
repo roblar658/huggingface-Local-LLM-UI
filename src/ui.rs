@@ -756,6 +756,26 @@ impl eframe::App for HfAssistantApp {
                             .color(egui::Color32::from_rgb(50, 220, 100)),
                         );
                         ui.separator();
+                        if let Ok(guard) = self.loaded_llm.lock() {
+                            if let Some(ref model) = *guard {
+                                let st = model.get_hybrid_status();
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "⚡ {}",
+                                        st.summary()
+                                    ))
+                                    .color(if st.gpu_layers == st.total_layers && st.total_layers > 0 {
+                                        egui::Color32::from_rgb(50, 220, 100)
+                                    } else if st.gpu_layers > 0 {
+                                        egui::Color32::from_rgb(80, 210, 255)
+                                    } else {
+                                        egui::Color32::from_rgb(240, 200, 50)
+                                    })
+                                    .strong(),
+                                );
+                                ui.separator();
+                            }
+                        }
                         let badge_color = match self.resource_snapshot.level {
                             ResourceLevel::OptimalSubMax => egui::Color32::from_rgb(80, 210, 255),
                             ResourceLevel::Balanced => egui::Color32::from_rgb(180, 200, 255),
@@ -896,6 +916,10 @@ impl HfAssistantApp {
                                         FitLevel::FullGpuOffload => (
                                             "🟢 Rask (Full GPU VRAM)",
                                             egui::Color32::from_rgb(50, 220, 100),
+                                        ),
+                                        FitLevel::HybridGpuCpu => (
+                                            "⚡ Hybrid (Delvis GPU + CPU)",
+                                            egui::Color32::from_rgb(80, 210, 255),
                                         ),
                                         FitLevel::CpuRamFallback => (
                                             "🟡 Medium (System-RAM / CPU)",
@@ -1248,17 +1272,8 @@ impl HfAssistantApp {
                     Ok(mut model) => {
                         model.set_resource_governor(gov);
                         let arch = model.architecture.clone();
-                        let gpu_info = if let Some(cuda) = crate::gpu::CudaEngine::global() {
-                            let gb = cuda.offloaded_bytes.load(Ordering::Relaxed) as f64
-                                / (1024.0 * 1024.0 * 1024.0);
-                            let tens = cuda.offloaded_tensors.load(Ordering::Relaxed);
-                            format!(
-                                " [{:.2} GB / {} tensorer i GPU VRAM på {}]",
-                                gb, tens, cuda.device_name
-                            )
-                        } else {
-                            String::new()
-                        };
+                        let hybrid = model.get_hybrid_status();
+                        let gpu_info = format!(" [{}]", hybrid.summary());
                         let mut guard = arc_llm.lock().unwrap();
                         *guard = Some(model);
                         ui_ctx.request_repaint();
@@ -1292,6 +1307,15 @@ impl HfAssistantApp {
                         p.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 );
+                if let Ok(guard) = self.loaded_llm.lock() {
+                    if let Some(ref model) = *guard {
+                        let st = model.get_hybrid_status();
+                        ui.colored_label(
+                            egui::Color32::from_rgb(80, 210, 255),
+                            format!("— {}", st.summary()),
+                        );
+                    }
+                }
             } else {
                 ui.colored_label(
                     egui::Color32::YELLOW,

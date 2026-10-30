@@ -41,7 +41,10 @@ Applikasjonen tilbyr et komplett miljø for å finne, vurdere og kjøre åpne sp
 - **Direkte GPU-akselerasjon via CUDA Driver API (`nvcuda.dll`) og PTX**:
   - Egenutviklede warp-reduserende CUDA PTX-kjerner (`matmul_q4k`, `matmul_q6k`, `matmul_q5k`, `matmul_q8_0`, `matmul_q4_0`, `matmul_f16`, `matmul_bf16`, `matmul_f32` og `swiglu_f32`) lastes direkte inn via `nvcuda.dll` uten krav om eksterne biblioteker ved kjøring.
   - **Fusjonerte GPU-pipelines**: Q/K/V-projeksjoner og SSM-projeksjoner som deler samme input kjøres i grupperte GPU-kall med kun én PCIe-overføring, og hele SwiGLU Feed-Forward Network (`ffn_gate`, `ffn_up`, `swiglu_f32`, `ffn_down`) kjøres fusjonert i VRAM/L2-cache uten mellomliggende kopiering til CPU.
-  - **Hybrid GPU+CPU-fallback**: Lag og vekter som passer innenfor den trygge VRAM-rammen kjøres direkte på GPU, mens eventuelle overskytende vekter kjøres sømløst på CPU med AVX2 og FMA.
+  - **Dynamisk hybrid GPU/CPU-fordeling (lagvis allokering og sanntidstilpasning)**:
+    - Modeller som er for store til å passe i VRAM alene (f.eks. 9B, 14B eller 32B på 6 GB / 8 GB GPU), kjøres som en sømløs hybrid der en del av transformator-lagene akselereres i GPU VRAM og resterende lag kjøres på CPU.
+    - Hvert lag håndteres som en koherent beregningsenhet slik at GPU-lagene fullt ut utnytter fusjonerte PTX-kjerner (f.eks. samtidig Q/K/V og VRAM-intern SwiGLU).
+    - **Dynamisk tilpasning ved oppstart og sanntid**: Fordelingen er ikke fastlåst. Ved innlasting allokeres så mange lag som trygt får plass i VRAM med minst 1600 MB fri sikkerhetsmargin. Under kjøring overvåker motoren kontinuerlig faktisk ledig VRAM og systemtrykk via NVML. Ved økt VRAM-press (f.eks. hvis brukeren åpner andre programmer) flyttes lag dynamisk fra GPU til CPU for å unngå krasj, og forfremmes automatisk tilbake til GPU når ressurser frigjøres.
 - **Zero-Copy minnekartlegging**: Benytter Win32 API (`CreateFileMappingW` og `MapViewOfFile`) for å kartlegge fler-gigabyte `.gguf`-filer direkte fra disk uten unødig allokering i sidevekslingsfilen.
 - **Dynamisk oppdelt prefill (Chunked Prefill)**: Innkommende prompts prosesseres i dynamiske del-batches tilpasset ledig RAM og VRAM.
 - **GGUF-parser**: Fullstendig parser for GGUF-formatversjoner 1, 2 og 3, inkludert metadatastruktur, arraytyper og tensordeskriptorer.

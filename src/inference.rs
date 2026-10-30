@@ -521,7 +521,54 @@ pub struct MmapWeight {
     pub gpu_buf: Option<Arc<crate::gpu::CudaWeightBuffer>>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct HybridStatus {
+    pub total_layers: usize,
+    pub gpu_layers: usize,
+    pub cpu_layers: usize,
+    pub gpu_vram_bytes: usize,
+    pub output_on_gpu: bool,
+}
+
+impl HybridStatus {
+    pub fn summary(&self) -> String {
+        let vram_gb = (self.gpu_vram_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+        if self.gpu_layers == self.total_layers && self.total_layers > 0 {
+            format!("Full GPU (alle {}/{} lag i VRAM: {:.2} GB)", self.gpu_layers, self.total_layers, vram_gb)
+        } else if self.gpu_layers > 0 {
+            format!(
+                "Hybrid GPU+CPU (dynamisk): {}/{} lag i GPU ({:.2} GB VRAM) + {} lag på CPU",
+                self.gpu_layers, self.total_layers, vram_gb, self.cpu_layers
+            )
+        } else {
+            format!("Ren CPU (alle {} lag i systemminne via AVX2+FMA)", self.total_layers)
+        }
+    }
+}
+
 impl MmapWeight {
+    pub fn try_promote_to_gpu(&mut self) -> bool {
+        if self.gpu_buf.is_some() {
+            return true;
+        }
+        let Some(cuda) = crate::gpu::CudaEngine::global() else {
+            return false;
+        };
+        if !cuda.can_safely_alloc(self.byte_len) {
+            return false;
+        }
+        if let Some(buf) = cuda.try_upload_weight(self.bytes(), self.dtype) {
+            self.gpu_buf = Some(buf);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn evict_from_gpu(&mut self) {
+        self.gpu_buf = None;
+    }
+
     #[inline(always)]
     pub fn bytes(&self) -> &[u8] {
         &self.mmap.as_slice()[self.abs_offset..self.abs_offset + self.byte_len]
@@ -1667,6 +1714,145 @@ struct Qwen35Block {
     ffn_down: MmapWeight,
 }
 
+impl Qwen35Block {
+    pub fn is_on_gpu(&self) -> bool {
+        match &self.mixer {
+            Qwen35Mixer::FullAttention(attn) => {
+                attn.attn_q.gpu_buf.is_some() && self.ffn_gate.gpu_buf.is_some()
+            }
+            Qwen35Mixer::GatedDeltaNet(ssm) => {
+                ssm.attn_qkv.gpu_buf.is_some() && self.ffn_gate.gpu_buf.is_some()
+            }
+        }
+    }
+
+    pub fn total_weight_bytes(&self) -> usize {
+        let ffn = self.ffn_gate.byte_len + self.ffn_up.byte_len + self.ffn_down.byte_len;
+        let mixer = match &self.mixer {
+            Qwen35Mixer::FullAttention(attn) => {
+                attn.attn_q.byte_len + attn.attn_k.byte_len + attn.attn_v.byte_len + attn.attn_output.byte_len
+            }
+            Qwen35Mixer::GatedDeltaNet(ssm) => {
+                ssm.attn_qkv.byte_len + ssm.attn_gate.byte_len + ssm.ssm_alpha.byte_len + ssm.ssm_beta.byte_len + ssm.ssm_out.byte_len
+            }
+        };
+        ffn + mixer
+    }
+
+    pub fn gpu_bytes(&self) -> usize {
+        let mut sum = 0usize;
+        for w in [&self.ffn_gate, &self.ffn_up, &self.ffn_down] {
+            if let Some(ref b) = w.gpu_buf {
+                sum += b.byte_len;
+            }
+        }
+        match &self.mixer {
+            Qwen35Mixer::FullAttention(attn) => {
+                for w in [&attn.attn_q, &attn.attn_k, &attn.attn_v, &attn.attn_output] {
+                    if let Some(ref b) = w.gpu_buf {
+                        sum += b.byte_len;
+                    }
+                }
+            }
+            Qwen35Mixer::GatedDeltaNet(ssm) => {
+                for w in [&ssm.attn_qkv, &ssm.attn_gate, &ssm.ssm_alpha, &ssm.ssm_beta, &ssm.ssm_out] {
+                    if let Some(ref b) = w.gpu_buf {
+                        sum += b.byte_len;
+                    }
+                }
+            }
+        }
+        sum
+    }
+
+    pub fn try_promote_to_gpu(&mut self) -> bool {
+        if self.is_on_gpu() {
+            return true;
+        }
+        let Some(cuda) = crate::gpu::CudaEngine::global() else {
+            return false;
+        };
+        let needed = self.total_weight_bytes();
+        if !cuda.can_safely_alloc(needed) {
+            return false;
+        }
+
+        let b_gate = cuda.try_upload_weight(self.ffn_gate.bytes(), self.ffn_gate.dtype);
+        let b_up = cuda.try_upload_weight(self.ffn_up.bytes(), self.ffn_up.dtype);
+        let b_down = cuda.try_upload_weight(self.ffn_down.bytes(), self.ffn_down.dtype);
+
+        match &mut self.mixer {
+            Qwen35Mixer::FullAttention(attn) => {
+                let b_q = cuda.try_upload_weight(attn.attn_q.bytes(), attn.attn_q.dtype);
+                let b_k = cuda.try_upload_weight(attn.attn_k.bytes(), attn.attn_k.dtype);
+                let b_v = cuda.try_upload_weight(attn.attn_v.bytes(), attn.attn_v.dtype);
+                let b_out = cuda.try_upload_weight(attn.attn_output.bytes(), attn.attn_output.dtype);
+
+                if b_q.is_some() && b_k.is_some() && b_v.is_some() && b_out.is_some()
+                    && b_gate.is_some() && b_up.is_some() && b_down.is_some()
+                {
+                    attn.attn_q.gpu_buf = b_q;
+                    attn.attn_k.gpu_buf = b_k;
+                    attn.attn_v.gpu_buf = b_v;
+                    attn.attn_output.gpu_buf = b_out;
+                    self.ffn_gate.gpu_buf = b_gate;
+                    self.ffn_up.gpu_buf = b_up;
+                    self.ffn_down.gpu_buf = b_down;
+                    true
+                } else {
+                    self.evict_from_gpu();
+                    false
+                }
+            }
+            Qwen35Mixer::GatedDeltaNet(ssm) => {
+                let b_qkv = cuda.try_upload_weight(ssm.attn_qkv.bytes(), ssm.attn_qkv.dtype);
+                let b_g = cuda.try_upload_weight(ssm.attn_gate.bytes(), ssm.attn_gate.dtype);
+                let b_alpha = cuda.try_upload_weight(ssm.ssm_alpha.bytes(), ssm.ssm_alpha.dtype);
+                let b_beta = cuda.try_upload_weight(ssm.ssm_beta.bytes(), ssm.ssm_beta.dtype);
+                let b_out = cuda.try_upload_weight(ssm.ssm_out.bytes(), ssm.ssm_out.dtype);
+
+                if b_qkv.is_some() && b_g.is_some() && b_alpha.is_some() && b_beta.is_some() && b_out.is_some()
+                    && b_gate.is_some() && b_up.is_some() && b_down.is_some()
+                {
+                    ssm.attn_qkv.gpu_buf = b_qkv;
+                    ssm.attn_gate.gpu_buf = b_g;
+                    ssm.ssm_alpha.gpu_buf = b_alpha;
+                    ssm.ssm_beta.gpu_buf = b_beta;
+                    ssm.ssm_out.gpu_buf = b_out;
+                    self.ffn_gate.gpu_buf = b_gate;
+                    self.ffn_up.gpu_buf = b_up;
+                    self.ffn_down.gpu_buf = b_down;
+                    true
+                } else {
+                    self.evict_from_gpu();
+                    false
+                }
+            }
+        }
+    }
+
+    pub fn evict_from_gpu(&mut self) {
+        self.ffn_gate.gpu_buf = None;
+        self.ffn_up.gpu_buf = None;
+        self.ffn_down.gpu_buf = None;
+        match &mut self.mixer {
+            Qwen35Mixer::FullAttention(attn) => {
+                attn.attn_q.gpu_buf = None;
+                attn.attn_k.gpu_buf = None;
+                attn.attn_v.gpu_buf = None;
+                attn.attn_output.gpu_buf = None;
+            }
+            Qwen35Mixer::GatedDeltaNet(ssm) => {
+                ssm.attn_qkv.gpu_buf = None;
+                ssm.attn_gate.gpu_buf = None;
+                ssm.ssm_alpha.gpu_buf = None;
+                ssm.ssm_beta.gpu_buf = None;
+                ssm.ssm_out.gpu_buf = None;
+            }
+        }
+    }
+}
+
 pub struct Qwen35NativeEngine {
     tok_embeddings: MmapWeight,
     output_norm: Vec<f32>,
@@ -1728,8 +1914,8 @@ impl Qwen35NativeEngine {
         let tok_embeddings = gguf.tensor_no_gpu("token_embd.weight")?;
         let output_norm = gguf.tensor_f32_1d("output_norm.weight")?;
         let output = gguf
-            .tensor("output.weight")
-            .or_else(|_| gguf.tensor("token_embd.weight"))?;
+            .tensor_no_gpu("output.weight")
+            .or_else(|_| gguf.tensor_no_gpu("token_embd.weight"))?;
 
         let mut blocks = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
@@ -1737,18 +1923,18 @@ impl Qwen35NativeEngine {
             let attn_norm = gguf.tensor_f32_1d(&format!("{}.attn_norm.weight", prefix))?;
             let post_attention_norm =
                 gguf.tensor_f32_1d(&format!("{}.post_attention_norm.weight", prefix))?;
-            let ffn_gate = gguf.tensor(&format!("{}.ffn_gate.weight", prefix))?;
-            let ffn_up = gguf.tensor(&format!("{}.ffn_up.weight", prefix))?;
-            let ffn_down = gguf.tensor(&format!("{}.ffn_down.weight", prefix))?;
+            let ffn_gate = gguf.tensor_no_gpu(&format!("{}.ffn_gate.weight", prefix))?;
+            let ffn_up = gguf.tensor_no_gpu(&format!("{}.ffn_up.weight", prefix))?;
+            let ffn_down = gguf.tensor_no_gpu(&format!("{}.ffn_down.weight", prefix))?;
 
             let has_full_attn = gguf
                 .tensors
                 .contains_key(&format!("{}.attn_q.weight", prefix));
             let mixer = if has_full_attn {
-                let attn_q = gguf.tensor(&format!("{}.attn_q.weight", prefix))?;
-                let attn_k = gguf.tensor(&format!("{}.attn_k.weight", prefix))?;
-                let attn_v = gguf.tensor(&format!("{}.attn_v.weight", prefix))?;
-                let attn_output = gguf.tensor(&format!("{}.attn_output.weight", prefix))?;
+                let attn_q = gguf.tensor_no_gpu(&format!("{}.attn_q.weight", prefix))?;
+                let attn_k = gguf.tensor_no_gpu(&format!("{}.attn_k.weight", prefix))?;
+                let attn_v = gguf.tensor_no_gpu(&format!("{}.attn_v.weight", prefix))?;
+                let attn_output = gguf.tensor_no_gpu(&format!("{}.attn_output.weight", prefix))?;
                 let attn_q_norm = gguf.tensor_f32_1d(&format!("{}.attn_q_norm.weight", prefix))?;
                 let attn_k_norm = gguf.tensor_f32_1d(&format!("{}.attn_k_norm.weight", prefix))?;
                 Qwen35Mixer::FullAttention(Qwen35AttentionLayer {
@@ -1762,11 +1948,11 @@ impl Qwen35NativeEngine {
                     v_cache: Vec::new(),
                 })
             } else {
-                let attn_qkv = gguf.tensor(&format!("{}.attn_qkv.weight", prefix))?;
-                let attn_gate = gguf.tensor(&format!("{}.attn_gate.weight", prefix))?;
-                let ssm_alpha = gguf.tensor(&format!("{}.ssm_alpha.weight", prefix))?;
-                let ssm_beta = gguf.tensor(&format!("{}.ssm_beta.weight", prefix))?;
-                let ssm_out = gguf.tensor(&format!("{}.ssm_out.weight", prefix))?;
+                let attn_qkv = gguf.tensor_no_gpu(&format!("{}.attn_qkv.weight", prefix))?;
+                let attn_gate = gguf.tensor_no_gpu(&format!("{}.attn_gate.weight", prefix))?;
+                let ssm_alpha = gguf.tensor_no_gpu(&format!("{}.ssm_alpha.weight", prefix))?;
+                let ssm_beta = gguf.tensor_no_gpu(&format!("{}.ssm_beta.weight", prefix))?;
+                let ssm_out = gguf.tensor_no_gpu(&format!("{}.ssm_out.weight", prefix))?;
                 let (ssm_conv1d, conv_dims) =
                     gguf.tensor_f32_flat(&format!("{}.ssm_conv1d.weight", prefix))?;
                 let conv_channels = conv_dims[0];
@@ -1801,7 +1987,7 @@ impl Qwen35NativeEngine {
             });
         }
 
-        Ok(Self {
+        let mut engine = Self {
             tok_embeddings,
             output_norm,
             output,
@@ -1819,7 +2005,89 @@ impl Qwen35NativeEngine {
             ssm_n_group,
             rope_cos,
             rope_sin,
-        })
+        };
+
+        if let Some(cuda) = crate::gpu::CudaEngine::global() {
+            println!("Starter dynamisk lag-allokering på GPU ({}) ...", cuda.device_name);
+            for (i, blk) in engine.blocks.iter_mut().enumerate() {
+                if !blk.try_promote_to_gpu() {
+                    println!("GPU VRAM nådde trygg sub-maksgrense ved lag {}. Resterende lag kjøres på CPU.", i);
+                    break;
+                }
+            }
+            if engine.blocks.iter().all(|b| b.is_on_gpu()) {
+                let _ = engine.output.try_promote_to_gpu();
+            }
+        }
+        let status = engine.get_hybrid_status();
+        println!("Allokeringsstatus: {}", status.summary());
+        Ok(engine)
+    }
+
+    pub fn get_hybrid_status(&self) -> HybridStatus {
+        let total_layers = self.blocks.len();
+        let gpu_layers = self.blocks.iter().filter(|b| b.is_on_gpu()).count();
+        let cpu_layers = total_layers.saturating_sub(gpu_layers);
+        let mut gpu_vram_bytes: usize = self.blocks.iter().map(|b| b.gpu_bytes()).sum();
+        let output_on_gpu = self.output.gpu_buf.is_some();
+        if let Some(ref buf) = self.output.gpu_buf {
+            gpu_vram_bytes += buf.byte_len;
+        }
+        HybridStatus {
+            total_layers,
+            gpu_layers,
+            cpu_layers,
+            gpu_vram_bytes,
+            output_on_gpu,
+        }
+    }
+
+    pub fn dynamically_adjust_placement(&mut self, snap: &crate::hardware::ResourceSnapshot) -> Option<String> {
+        let Some(cuda) = crate::gpu::CudaEngine::global() else {
+            return None;
+        };
+
+        if snap.level == crate::hardware::ResourceLevel::CriticalPause
+            || snap.level == crate::hardware::ResourceLevel::LowResources
+            || cuda.is_vram_under_pressure()
+        {
+            for i in (0..self.blocks.len()).rev() {
+                if self.blocks[i].is_on_gpu() {
+                    self.blocks[i].evict_from_gpu();
+                    let st = self.get_hybrid_status();
+                    let msg = format!("⚡ Dynamisk avlasting: flyttet lag {} til CPU (VRAM-trykk). Nå: {}/{} på GPU", i, st.gpu_layers, st.total_layers);
+                    println!("{}", msg);
+                    return Some(msg);
+                }
+            }
+            if self.output.gpu_buf.is_some() {
+                self.output.evict_from_gpu();
+                return Some("⚡ Dynamisk avlasting: flyttet output-lag til CPU".to_string());
+            }
+        } else if snap.level == crate::hardware::ResourceLevel::OptimalSubMax
+            && !cuda.is_vram_under_pressure()
+        {
+            for i in 0..self.blocks.len() {
+                if !self.blocks[i].is_on_gpu() {
+                    let needed = self.blocks[i].total_weight_bytes();
+                    if cuda.can_safely_alloc(needed) {
+                        if self.blocks[i].try_promote_to_gpu() {
+                            let st = self.get_hybrid_status();
+                            let msg = format!("⚡ Dynamisk akselerasjon: forfremmet lag {} til GPU VRAM. Nå: {}/{} på GPU", i, st.gpu_layers, st.total_layers);
+                            println!("{}", msg);
+                            return Some(msg);
+                        }
+                    }
+                    break;
+                }
+            }
+            if !self.output.gpu_buf.is_some() && cuda.can_safely_alloc(self.output.byte_len) {
+                if self.output.try_promote_to_gpu() {
+                    return Some("⚡ Dynamisk akselerasjon: forfremmet output-lag til GPU VRAM".to_string());
+                }
+            }
+        }
+        None
     }
 
     pub fn clear_state(&mut self) {
@@ -2140,6 +2408,77 @@ struct StandardBlock {
     v_cache: Vec<f32>,
 }
 
+impl StandardBlock {
+    pub fn is_on_gpu(&self) -> bool {
+        self.attn_q.gpu_buf.is_some() && self.ffn_gate.gpu_buf.is_some()
+    }
+
+    pub fn total_weight_bytes(&self) -> usize {
+        self.attn_q.byte_len + self.attn_k.byte_len + self.attn_v.byte_len +
+        self.attn_output.byte_len + self.ffn_gate.byte_len + self.ffn_up.byte_len +
+        self.ffn_down.byte_len
+    }
+
+    pub fn gpu_bytes(&self) -> usize {
+        let mut s = 0;
+        for w in [
+            &self.attn_q, &self.attn_k, &self.attn_v, &self.attn_output,
+            &self.ffn_gate, &self.ffn_up, &self.ffn_down
+        ] {
+            if let Some(ref b) = w.gpu_buf {
+                s += b.byte_len;
+            }
+        }
+        s
+    }
+
+    pub fn try_promote_to_gpu(&mut self) -> bool {
+        if self.is_on_gpu() {
+            return true;
+        }
+        let Some(cuda) = crate::gpu::CudaEngine::global() else {
+            return false;
+        };
+        let needed = self.total_weight_bytes();
+        if !cuda.can_safely_alloc(needed) {
+            return false;
+        }
+        let b_q = cuda.try_upload_weight(self.attn_q.bytes(), self.attn_q.dtype);
+        let b_k = cuda.try_upload_weight(self.attn_k.bytes(), self.attn_k.dtype);
+        let b_v = cuda.try_upload_weight(self.attn_v.bytes(), self.attn_v.dtype);
+        let b_out = cuda.try_upload_weight(self.attn_output.bytes(), self.attn_output.dtype);
+        let b_gate = cuda.try_upload_weight(self.ffn_gate.bytes(), self.ffn_gate.dtype);
+        let b_up = cuda.try_upload_weight(self.ffn_up.bytes(), self.ffn_up.dtype);
+        let b_down = cuda.try_upload_weight(self.ffn_down.bytes(), self.ffn_down.dtype);
+
+        if b_q.is_some() && b_k.is_some() && b_v.is_some() && b_out.is_some()
+            && b_gate.is_some() && b_up.is_some() && b_down.is_some()
+        {
+            self.attn_q.gpu_buf = b_q;
+            self.attn_k.gpu_buf = b_k;
+            self.attn_v.gpu_buf = b_v;
+            self.attn_output.gpu_buf = b_out;
+            self.ffn_gate.gpu_buf = b_gate;
+            self.ffn_up.gpu_buf = b_up;
+            self.ffn_down.gpu_buf = b_down;
+            true
+        } else {
+            self.evict_from_gpu();
+            false
+        }
+    }
+
+    pub fn evict_from_gpu(&mut self) {
+        self.attn_q.gpu_buf = None;
+        self.attn_k.gpu_buf = None;
+        self.attn_v.gpu_buf = None;
+        self.attn_output.gpu_buf = None;
+        self.ffn_gate.gpu_buf = None;
+        self.ffn_up.gpu_buf = None;
+        self.ffn_down.gpu_buf = None;
+    }
+}
+
 pub struct StandardNativeEngine {
     tok_embeddings: MmapWeight,
     output_norm: Vec<f32>,
@@ -2196,24 +2535,24 @@ impl StandardNativeEngine {
         let tok_embeddings = gguf.tensor_no_gpu("token_embd.weight")?;
         let output_norm = gguf.tensor_f32_1d("output_norm.weight")?;
         let output = gguf
-            .tensor("output.weight")
-            .or_else(|_| gguf.tensor("token_embd.weight"))?;
+            .tensor_no_gpu("output.weight")
+            .or_else(|_| gguf.tensor_no_gpu("token_embd.weight"))?;
 
         let mut blocks = Vec::with_capacity(n_layers);
         for i in 0..n_layers {
             let p = format!("blk.{}", i);
             let attn_norm = gguf.tensor_f32_1d(&format!("{}.attn_norm.weight", p))?;
-            let attn_q = gguf.tensor(&format!("{}.attn_q.weight", p))?;
-            let attn_k = gguf.tensor(&format!("{}.attn_k.weight", p))?;
-            let attn_v = gguf.tensor(&format!("{}.attn_v.weight", p))?;
+            let attn_q = gguf.tensor_no_gpu(&format!("{}.attn_q.weight", p))?;
+            let attn_k = gguf.tensor_no_gpu(&format!("{}.attn_k.weight", p))?;
+            let attn_v = gguf.tensor_no_gpu(&format!("{}.attn_v.weight", p))?;
             let attn_q_bias = gguf.tensor_f32_1d(&format!("{}.attn_q.bias", p)).ok();
             let attn_k_bias = gguf.tensor_f32_1d(&format!("{}.attn_k.bias", p)).ok();
             let attn_v_bias = gguf.tensor_f32_1d(&format!("{}.attn_v.bias", p)).ok();
-            let attn_output = gguf.tensor(&format!("{}.attn_output.weight", p))?;
+            let attn_output = gguf.tensor_no_gpu(&format!("{}.attn_output.weight", p))?;
             let ffn_norm = gguf.tensor_f32_1d(&format!("{}.ffn_norm.weight", p))?;
-            let ffn_gate = gguf.tensor(&format!("{}.ffn_gate.weight", p))?;
-            let ffn_up = gguf.tensor(&format!("{}.ffn_up.weight", p))?;
-            let ffn_down = gguf.tensor(&format!("{}.ffn_down.weight", p))?;
+            let ffn_gate = gguf.tensor_no_gpu(&format!("{}.ffn_gate.weight", p))?;
+            let ffn_up = gguf.tensor_no_gpu(&format!("{}.ffn_up.weight", p))?;
+            let ffn_down = gguf.tensor_no_gpu(&format!("{}.ffn_down.weight", p))?;
 
             blocks.push(StandardBlock {
                 attn_norm,
@@ -2233,7 +2572,7 @@ impl StandardNativeEngine {
             });
         }
 
-        Ok(Self {
+        let mut engine = Self {
             tok_embeddings,
             output_norm,
             output,
@@ -2245,7 +2584,89 @@ impl StandardNativeEngine {
             rms_eps,
             rope_cos,
             rope_sin,
-        })
+        };
+
+        if let Some(cuda) = crate::gpu::CudaEngine::global() {
+            println!("Starter dynamisk lag-allokering på GPU ({}) ...", cuda.device_name);
+            for (i, blk) in engine.blocks.iter_mut().enumerate() {
+                if !blk.try_promote_to_gpu() {
+                    println!("GPU VRAM nådde trygg sub-maksgrense ved lag {}. Resterende lag kjøres på CPU.", i);
+                    break;
+                }
+            }
+            if engine.blocks.iter().all(|b| b.is_on_gpu()) {
+                let _ = engine.output.try_promote_to_gpu();
+            }
+        }
+        let status = engine.get_hybrid_status();
+        println!("Allokeringsstatus: {}", status.summary());
+        Ok(engine)
+    }
+
+    pub fn get_hybrid_status(&self) -> HybridStatus {
+        let total_layers = self.blocks.len();
+        let gpu_layers = self.blocks.iter().filter(|b| b.is_on_gpu()).count();
+        let cpu_layers = total_layers.saturating_sub(gpu_layers);
+        let mut gpu_vram_bytes: usize = self.blocks.iter().map(|b| b.gpu_bytes()).sum();
+        let output_on_gpu = self.output.gpu_buf.is_some();
+        if let Some(ref buf) = self.output.gpu_buf {
+            gpu_vram_bytes += buf.byte_len;
+        }
+        HybridStatus {
+            total_layers,
+            gpu_layers,
+            cpu_layers,
+            gpu_vram_bytes,
+            output_on_gpu,
+        }
+    }
+
+    pub fn dynamically_adjust_placement(&mut self, snap: &crate::hardware::ResourceSnapshot) -> Option<String> {
+        let Some(cuda) = crate::gpu::CudaEngine::global() else {
+            return None;
+        };
+
+        if snap.level == crate::hardware::ResourceLevel::CriticalPause
+            || snap.level == crate::hardware::ResourceLevel::LowResources
+            || cuda.is_vram_under_pressure()
+        {
+            for i in (0..self.blocks.len()).rev() {
+                if self.blocks[i].is_on_gpu() {
+                    self.blocks[i].evict_from_gpu();
+                    let st = self.get_hybrid_status();
+                    let msg = format!("⚡ Dynamisk avlasting: flyttet lag {} til CPU (VRAM-trykk). Nå: {}/{} på GPU", i, st.gpu_layers, st.total_layers);
+                    println!("{}", msg);
+                    return Some(msg);
+                }
+            }
+            if self.output.gpu_buf.is_some() {
+                self.output.evict_from_gpu();
+                return Some("⚡ Dynamisk avlasting: flyttet output-lag til CPU".to_string());
+            }
+        } else if snap.level == crate::hardware::ResourceLevel::OptimalSubMax
+            && !cuda.is_vram_under_pressure()
+        {
+            for i in 0..self.blocks.len() {
+                if !self.blocks[i].is_on_gpu() {
+                    let needed = self.blocks[i].total_weight_bytes();
+                    if cuda.can_safely_alloc(needed) {
+                        if self.blocks[i].try_promote_to_gpu() {
+                            let st = self.get_hybrid_status();
+                            let msg = format!("⚡ Dynamisk akselerasjon: forfremmet lag {} til GPU VRAM. Nå: {}/{} på GPU", i, st.gpu_layers, st.total_layers);
+                            println!("{}", msg);
+                            return Some(msg);
+                        }
+                    }
+                    break;
+                }
+            }
+            if !self.output.gpu_buf.is_some() && cuda.can_safely_alloc(self.output.byte_len) {
+                if self.output.try_promote_to_gpu() {
+                    return Some("⚡ Dynamisk akselerasjon: forfremmet output-lag til GPU VRAM".to_string());
+                }
+            }
+        }
+        None
     }
 
     pub fn clear_state(&mut self) {
@@ -2426,6 +2847,20 @@ enum ActiveEngine {
 }
 
 impl ActiveEngine {
+    pub fn get_hybrid_status(&self) -> HybridStatus {
+        match self {
+            Self::Qwen35(m) => m.get_hybrid_status(),
+            Self::Standard(m) => m.get_hybrid_status(),
+        }
+    }
+
+    pub fn dynamically_adjust_placement(&mut self, snap: &crate::hardware::ResourceSnapshot) -> Option<String> {
+        match self {
+            Self::Qwen35(m) => m.dynamically_adjust_placement(snap),
+            Self::Standard(m) => m.dynamically_adjust_placement(snap),
+        }
+    }
+
     fn clear_state(&mut self) {
         match self {
             Self::Qwen35(m) => m.clear_state(),
@@ -2618,6 +3053,10 @@ impl LocalLlm {
         })
     }
 
+    pub fn get_hybrid_status(&self) -> HybridStatus {
+        self.engine.get_hybrid_status()
+    }
+
     pub fn set_resource_governor(
         &mut self,
         governor: std::sync::Arc<crate::hardware::ResourceGovernor>,
@@ -2661,6 +3100,9 @@ impl LocalLlm {
         let mut last_logits = Vec::new();
         while offset < tokens.len() {
             let snap = self.governor.pace_and_recover(cancel_flag, &mut *on_status)?;
+            if let Some(msg) = self.engine.dynamically_adjust_placement(&snap) {
+                on_status(&msg);
+            }
             let chunk_size = snap.prefill_chunk_size.max(1);
             let end = (offset + chunk_size).min(tokens.len());
 
@@ -2808,6 +3250,9 @@ impl LocalLlm {
 
         for _ in 0..max_tokens.saturating_sub(1) {
             let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
+            if let Some(msg) = self.engine.dynamically_adjust_placement(&snap) {
+                on_status(&msg);
+            }
             if eos_ids.contains(&next_token) {
                 self.pending_token = None;
                 break;
@@ -2889,6 +3334,9 @@ impl LocalLlm {
 
             for step in 0..extra_budget {
                 let snap = self.governor.pace_and_recover(cancel_flag, &mut on_status)?;
+                if let Some(msg) = self.engine.dynamically_adjust_placement(&snap) {
+                    on_status(&msg);
+                }
                 let Some(tok_to_feed) = self.pending_token.take() else {
                     break;
                 };

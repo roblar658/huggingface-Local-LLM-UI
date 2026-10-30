@@ -17,3 +17,4 @@ if (Test-Path $msiFile) {
     Write-Host "Sti:  $msiFile" -ForegroundColor Yellow
     Write-Host "Størrelse: $sizeMb MB" -ForegroundColor Yellow
 }
+

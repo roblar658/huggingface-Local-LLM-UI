@@ -4,6 +4,7 @@ use crate::hf_client::HfModel;
 #[derive(Debug, Clone)]
 pub enum FitLevel {
     FullGpuOffload,
+    HybridGpuCpu,
     CpuRamFallback,
     TooLarge,
 }
@@ -60,6 +61,10 @@ pub fn assess_model(model: &HfModel, hardware: &HardwareSpec) -> ModelAssessment
 
     let fit_level = if hardware.dedicated_vram_gb >= req_gb + 0.5 {
         FitLevel::FullGpuOffload
+    } else if hardware.dedicated_vram_gb >= 2.0
+        && (hardware.dedicated_vram_gb + hardware.available_ram_gb >= req_gb + 1.0)
+    {
+        FitLevel::HybridGpuCpu
     } else if hardware.available_ram_gb >= req_gb + 1.0 {
         FitLevel::CpuRamFallback
     } else {

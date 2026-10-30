@@ -399,6 +399,70 @@ impl CudaEngine {
         }
     }
 
+    /// Sjekker om det er trygt å allokere `bytes` i GPU VRAM uten å overskride sikkerhetsmarginen.
+    pub fn can_safely_alloc(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        unsafe {
+            if (self.cu_ctx_set_current)(self.ctx) != 0 {
+                return false;
+            }
+            let mut free_vram = 0usize;
+            let mut total_vram = 0usize;
+            if (self.cu_mem_get_info)(&mut free_vram, &mut total_vram) != 0 {
+                return false;
+            }
+            if let Some(tel) = query_gpu_telemetry() {
+                if tel.vram_total_mb > 0 {
+                    let nvml_free = (tel.vram_free_mb as usize) * 1024 * 1024;
+                    let nvml_total = (tel.vram_total_mb as usize) * 1024 * 1024;
+                    free_vram = free_vram.min(nvml_free);
+                    total_vram = total_vram.max(nvml_total);
+                }
+            }
+
+            let max_offload_bytes = (total_vram * 58) / 100;
+            let current_offloaded = self.offloaded_bytes.load(Ordering::Relaxed);
+            if current_offloaded + bytes > max_offload_bytes {
+                return false;
+            }
+
+            let safety_reserve = (total_vram / 5).max(1600 * 1024 * 1024);
+            if free_vram <= bytes + safety_reserve {
+                return false;
+            }
+            true
+        }
+    }
+
+    /// Returnerer true dersom GPU VRAM eller systemet er under merkbart minnepress
+    pub fn is_vram_under_pressure(&self) -> bool {
+        unsafe {
+            if (self.cu_ctx_set_current)(self.ctx) != 0 {
+                return true;
+            }
+            let mut free_vram = 0usize;
+            let mut total_vram = 0usize;
+            if (self.cu_mem_get_info)(&mut free_vram, &mut total_vram) != 0 {
+                return true;
+            }
+            if let Some(tel) = query_gpu_telemetry() {
+                if tel.vram_total_mb > 0 {
+                    let nvml_free = (tel.vram_free_mb as usize) * 1024 * 1024;
+                    let nvml_total = (tel.vram_total_mb as usize) * 1024 * 1024;
+                    free_vram = free_vram.min(nvml_free);
+                    total_vram = total_vram.max(nvml_total);
+                }
+            }
+
+            let safety_reserve = (total_vram / 5).max(1600 * 1024 * 1024);
+            let max_offload_bytes = (total_vram * 58) / 100;
+            let current_offloaded = self.offloaded_bytes.load(Ordering::Relaxed);
+            free_vram < safety_reserve || current_offloaded > max_offload_bytes
+        }
+    }
+
     /// Laster opp en GGUF-vekttensor til GPU VRAM kun dersom det er trygt over sikkerhetsmarginen
     /// (beholder alltid minst ~1.25 GB eller 16% av total VRAM ledig for OS, skjerm og andre programmer).
     pub fn try_upload_weight(
@@ -411,35 +475,12 @@ impl CudaEngine {
             return None;
         }
 
+        if !self.can_safely_alloc(bytes.len()) {
+            return None;
+        }
+
         unsafe {
             if (self.cu_ctx_set_current)(self.ctx) != 0 {
-                return None;
-            }
-            let mut free_vram = 0usize;
-            let mut total_vram = 0usize;
-            if (self.cu_mem_get_info)(&mut free_vram, &mut total_vram) != 0 {
-                return None;
-            }
-            // På Windows WDDM kan cuMemGetInfo inkludere delt minne; bruk faktisk fysisk ledig VRAM fra NVML
-            if let Some(tel) = query_gpu_telemetry() {
-                if tel.vram_total_mb > 0 {
-                    let nvml_free = (tel.vram_free_mb as usize) * 1024 * 1024;
-                    let nvml_total = (tel.vram_total_mb as usize) * 1024 * 1024;
-                    free_vram = free_vram.min(nvml_free);
-                    total_vram = total_vram.max(nvml_total);
-                }
-            }
-
-            // Trygg sub-maksimal VRAM-kvote: bruk maks 58% av total VRAM til vekter,
-            // og hold alltid minst 1600 MB (eller 20% av total VRAM) fysisk ledig!
-            let max_offload_bytes = (total_vram * 58) / 100;
-            let current_offloaded = self.offloaded_bytes.load(Ordering::Relaxed);
-            if current_offloaded + bytes.len() > max_offload_bytes {
-                return None;
-            }
-
-            let safety_reserve = (total_vram / 5).max(1600 * 1024 * 1024);
-            if free_vram <= bytes.len() + safety_reserve {
                 return None;
             }
 
