@@ -308,13 +308,17 @@ flowchart LR
 ### 4. Egenutviklet GPU- og CPU-inferensmotor
 - **Direkte GPU-akselerasjon via CUDA Driver API (`nvcuda.dll`) og PTX**:
   - Egenutviklede warp-reduserende CUDA PTX-kjerner (`matmul_q4k`, `matmul_q6k`, `matmul_q5k`, `matmul_q8_0`, `matmul_q4_0`, `matmul_f16`, `matmul_bf16`, `matmul_f32` og `swiglu_f32`) lastes direkte inn via `nvcuda.dll` uten krav om eksterne biblioteker ved kjøring.
-  - **Fusjonerte GPU-pipelines**: Q/K/V-projeksjoner og SSM-projeksjoner som deler samme input kjøres i grupperte GPU-kall med kun én PCIe-overføring, og hele SwiGLU Feed-Forward Network (`ffn_gate`, `ffn_up`, `swiglu_f32`, `ffn_down`) kjøres fusjonert i VRAM/L2-cache uten mellomliggende kopiering til CPU.
+  - **Skalert GPU-grid (opptil 512 blokker)**: Sikrer at moderne skjermkort (som GeForce RTX 4060) utnytter alle 24 Streaming Multiprocessors (SM) og 3072 CUDA-kjerner parallelt uten unødvendige sekvensielle bølger.
+  - **Fusjonerte GPU-pipelines og batched DMA-overføring**: Q/K/V-projeksjoner og SSM-projeksjoner som deler samme input kjøres i grupperte GPU-kall med én enkelt samlet PCIe-overføring, og hele SwiGLU Feed-Forward Network (`ffn_gate`, `ffn_up`, `swiglu_f32`, `ffn_down`) kjøres fusjonert i VRAM/L2-cache uten mellomliggende kopiering til CPU.
+  - **Lynrask inkrementell token-dekoding (O(1) streaming)**: Erstatter repetitiv full-sekvens dekoding med `FastIncrementalDecoder`. Dekoder kun nye tokens direkte til tekst med innebygd håndtering av flerbyte UTF-8 tegn, og eliminerer CPU-forsinkelser under tekststrømming.
+  - **Zero-allocation oppmerksomhetsbuffer (Stack Attention)**: Attention scores i transformator-lagene benytter en 2048-elementers stack-allokert buffer per hode, noe som fjerner hundrevis av heap-allokeringer og låsekonkurranse per token under multitrådet kjøring.
+  - **2x unrolled AVX2 og FMA i CPU-kjerner**: Vektoroperasjoner i CPU-lagene kjøres med to parallelle FMA-rader for optimal utnyttelse av uavhengige execution ports på moderne x86-64-prosessorer.
   - **Dynamisk hybrid GPU/CPU-fordeling (lagvis allokering og sanntidstilpasning)**:
     - Modeller som er for store til å passe i VRAM alene (f.eks. 9B, 14B eller 32B på 6 GB / 8 GB GPU), kjøres som en sømløs hybrid der en del av transformator-lagene akselereres i GPU VRAM og resterende lag kjøres på CPU.
     - Hvert lag håndteres som en koherent beregningsenhet slik at GPU-lagene fullt ut utnytter fusjonerte PTX-kjerner.
     - **Dynamisk tilpasning og hysterese-cooldown**: Fordelingen evalueres fortløpende mot NVML med minst 4 sekunders stabilitetsperiode for å unngå unødig lagflytting over PCIe under aktiv token-generering.
 - **Zero-Copy minnekartlegging**: Benytter Win32 API (`CreateFileMappingW` og `MapViewOfFile`) for å kartlegge fler-gigabyte `.gguf`-filer direkte fra disk uten unødig allokering i sidevekslingsfilen.
-- **Dynamisk oppdelt prefill (Chunked Prefill)**: Innkommende prompts prosesseres i dynamiske del-batches tilpasset ledig RAM og VRAM.
+- **Dynamisk oppdelt prefill (Chunked Prefill)**: Innkommende prompts prosesseres i dynamiske del-batches tilpasset ledig RAM og VRAM (48-64 tokens i sub-maksimal modus).
 - **GGUF-parser**: Fullstendig parser for GGUF-formatversjoner 1, 2 og 3, inkludert metadatastruktur, arraytyper og tensordeskriptorer.
 - **Modellarkitekturer**:
   - `qwen35`: Hybridarkitektur med Gated DeltaNet State Space Model (SSM) og Full Attention (støtter opptil 8192 tokens kontekstlengde).

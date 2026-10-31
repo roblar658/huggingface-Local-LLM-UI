@@ -252,13 +252,13 @@ impl ResourceGovernor {
                 || avail_page_file_mb < 350
                 || gpu_hot_crit
             {
-                (ResourceLevel::CriticalPause, 1, 8, 15)
+                (ResourceLevel::CriticalPause, 1, 16, 12)
             } else if avail_phys_mb < 900
                 || avail_page_file_mb < 800
                 || memory_load_pct >= 92
                 || gpu_hot_low
             {
-                (ResourceLevel::LowResources, self.low_threads, 12, 6)
+                (ResourceLevel::LowResources, self.low_threads, 24, 4)
             } else if !app_focused
                 || avail_phys_mb < 1800
                 || avail_page_file_mb < 1600
@@ -266,25 +266,26 @@ impl ResourceGovernor {
                 || gpu_hot_bal
                 || vram_tight
             {
-                let sleep_ms = if !app_focused { 1 } else { 2 };
-                (ResourceLevel::Balanced, self.balanced_threads, 20, sleep_ms)
+                // Ved aktiv bruk unngår vi kunstig trådsøvn i Balanced slik at tekstflyten er lynrask
+                let sleep_ms = if !app_focused { 1 } else { 0 };
+                (ResourceLevel::Balanced, self.balanced_threads, 48, sleep_ms)
             } else {
-                (ResourceLevel::OptimalSubMax, self.submax_threads, 32, 0)
+                (ResourceLevel::OptimalSubMax, self.submax_threads, 64, 0)
             };
 
-        // Oppdater dynamisk CUDA thread-block tak slik at GPU alltid holder seg trygt under maks
+        // Oppdater dynamisk CUDA thread-block tak slik at GPU utnyttes optimalt (opptil 512 blokker)
         if let Some(cuda) = crate::gpu::CudaEngine::global() {
             let grid_cap = match level {
                 ResourceLevel::OptimalSubMax => {
-                    if tel.gpu_util_pct >= 90 {
-                        96
+                    if tel.gpu_util_pct >= 96 {
+                        256
                     } else {
-                        144
+                        512
                     }
                 }
-                ResourceLevel::Balanced => 56,
-                ResourceLevel::LowResources => 24,
-                ResourceLevel::CriticalPause => 8,
+                ResourceLevel::Balanced => 256,
+                ResourceLevel::LowResources => 64,
+                ResourceLevel::CriticalPause => 16,
             };
             cuda.max_grid_x.store(grid_cap, Ordering::Relaxed);
         }
@@ -445,6 +446,7 @@ pub fn lower_current_thread_priority(lowest: bool) {
 pub fn lower_current_thread_priority(_lowest: bool) {}
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn trim_process_working_set() {
     unsafe {
         let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);

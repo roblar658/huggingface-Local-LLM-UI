@@ -1321,6 +1321,16 @@ unsafe fn vec_axpy_f32_avx2(dst: &mut [f32], scale: f32, src: &[f32]) {
     let mut i = 0;
     let d_ptr = dst.as_mut_ptr();
     let s_ptr = src.as_ptr();
+    // 2x unrolling med to parallelle FMA-porter på x86-64 CPUer
+    while i + 16 <= n {
+        let vd0 = _mm256_loadu_ps(d_ptr.add(i));
+        let vs0 = _mm256_loadu_ps(s_ptr.add(i));
+        let vd1 = _mm256_loadu_ps(d_ptr.add(i + 8));
+        let vs1 = _mm256_loadu_ps(s_ptr.add(i + 8));
+        _mm256_storeu_ps(d_ptr.add(i), _mm256_fmadd_ps(s_vec, vs0, vd0));
+        _mm256_storeu_ps(d_ptr.add(i + 8), _mm256_fmadd_ps(s_vec, vs1, vd1));
+        i += 16;
+    }
     while i + 8 <= n {
         let vd = _mm256_loadu_ps(d_ptr.add(i));
         let vs = _mm256_loadu_ps(s_ptr.add(i));
@@ -2226,7 +2236,14 @@ impl Qwen35NativeEngine {
                                 let kh = h / gqa_ratio;
                                 let q_h = &q_s[h * head_dim..(h + 1) * head_dim];
                                 let gate_h = &gate_s[h * head_dim..(h + 1) * head_dim];
-                                let mut scores = vec![0.0f32; valid_t];
+                                let mut stack_scores = [0.0f32; 2048];
+                                let mut heap_scores;
+                                let scores: &mut [f32] = if valid_t <= 2048 {
+                                    &mut stack_scores[..valid_t]
+                                } else {
+                                    heap_scores = vec![0.0f32; valid_t];
+                                    &mut heap_scores[..]
+                                };
                                 let mut max_score = f32::NEG_INFINITY;
                                 for t in 0..valid_t {
                                     let k_t = &k_cache_ref[(t * n_kv_heads + kh) * head_dim
@@ -2238,7 +2255,7 @@ impl Qwen35NativeEngine {
                                     }
                                 }
                                 let mut sum_exp = 0.0f32;
-                                for sc in &mut scores {
+                                for sc in scores.iter_mut() {
                                     *sc = (*sc - max_score).exp();
                                     sum_exp += *sc;
                                 }
@@ -2284,14 +2301,13 @@ impl Qwen35NativeEngine {
                     let scale = 1.0f32 / (d_k as f32).sqrt();
 
                     let mut y_all = vec![0.0f32; seq_len * v_dim];
+                    let mut conv_out = vec![0.0f32; conv_channels];
 
                     for s in 0..seq_len {
                         let qkv_s = &qkv_raw[s * conv_channels..(s + 1) * conv_channels];
                         let z_s = &z_raw[s * v_dim..(s + 1) * v_dim];
                         let alpha_s = &alpha_raw[s * n_v_heads..(s + 1) * n_v_heads];
                         let beta_s = &beta_raw[s * n_v_heads..(s + 1) * n_v_heads];
-
-                        let mut conv_out = vec![0.0f32; conv_channels];
                         for c in 0..conv_channels {
                             let w_base = c * ssm_conv_kernel;
                             let st_base = c * hist_len;
@@ -2781,7 +2797,14 @@ impl StandardNativeEngine {
                     .for_each(|(h, out_h)| {
                         let kh = h / gqa_ratio;
                         let q_h = &q_s[h * head_dim..(h + 1) * head_dim];
-                        let mut scores = vec![0.0f32; valid_t];
+                        let mut stack_scores = [0.0f32; 2048];
+                        let mut heap_scores;
+                        let scores: &mut [f32] = if valid_t <= 2048 {
+                            &mut stack_scores[..valid_t]
+                        } else {
+                            heap_scores = vec![0.0f32; valid_t];
+                            &mut heap_scores[..]
+                        };
                         let mut max_score = f32::NEG_INFINITY;
                         for t in 0..valid_t {
                             let k_t = &k_cache_ref[(t * n_kv_heads + kh) * head_dim
@@ -2793,7 +2816,7 @@ impl StandardNativeEngine {
                             }
                         }
                         let mut sum_exp = 0.0f32;
-                        for sc in &mut scores {
+                        for sc in scores.iter_mut() {
                             *sc = (*sc - max_score).exp();
                             sum_exp += *sc;
                         }
@@ -2934,6 +2957,72 @@ fn has_excessive_repetition(tokens: &[u32]) -> bool {
         }
     }
     false
+}
+
+/// Lynrask inkrementell token-dekoder som erstatter O(N^2) full-sekvens re-dekoding.
+/// Holder styr på en glidende indeks og dekoder kun 1-3 tokens per steg, med automatisk
+/// håndtering av ufullstendige UTF-8 multi-byte tegn (f.eks. æ, ø, å og emojier).
+pub struct FastIncrementalDecoder {
+    tokens: Vec<u32>,
+    prev_index: usize,
+    current_index: usize,
+}
+
+impl FastIncrementalDecoder {
+    pub fn new() -> Self {
+        Self {
+            tokens: Vec::new(),
+            prev_index: 0,
+            current_index: 0,
+        }
+    }
+
+    pub fn push_token(&mut self, tokenizer: &tokenizers::Tokenizer, token: u32) -> Result<Option<String>> {
+        self.tokens.push(token);
+        let prev_text = if self.current_index > self.prev_index {
+            tokenizer
+                .decode(&self.tokens[self.prev_index..self.current_index], false)
+                .map_err(|e| anyhow!("{e}"))?
+        } else {
+            String::new()
+        };
+
+        let cur_text = tokenizer
+            .decode(&self.tokens[self.prev_index..], false)
+            .map_err(|e| anyhow!("{e}"))?;
+
+        if cur_text.len() > prev_text.len() && !cur_text.ends_with('\u{FFFD}') {
+            let delta = cur_text[prev_text.len()..].to_string();
+            self.prev_index = self.current_index;
+            self.current_index = self.tokens.len();
+            Ok(Some(delta))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn finish(&mut self, tokenizer: &tokenizers::Tokenizer) -> Result<Option<String>> {
+        if self.prev_index >= self.tokens.len() {
+            return Ok(None);
+        }
+        let full = tokenizer
+            .decode(&self.tokens[self.prev_index..], true)
+            .map_err(|e| anyhow!("{e}"))?;
+        let prev_text = if self.current_index > self.prev_index {
+            tokenizer
+                .decode(&self.tokens[self.prev_index..self.current_index], true)
+                .map_err(|e| anyhow!("{e}"))?
+        } else {
+            String::new()
+        };
+        self.prev_index = self.tokens.len();
+        self.current_index = self.tokens.len();
+        if full.len() > prev_text.len() {
+            Ok(Some(full[prev_text.len()..].to_string()))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 fn strip_continuation_prefix(s: &str) -> &str {
@@ -3240,7 +3329,7 @@ impl LocalLlm {
 
         let eos_ids = self.eos_token_ids();
         let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut prev_decoded_len = 0usize;
+        let mut decoder = FastIncrementalDecoder::new();
 
         // Dynamisk chunked prefill av promptet
         let logits = self.prefill_tokens_chunked(&prompt_tokens, cancel_flag, &mut on_status)?;
@@ -3253,12 +3342,12 @@ impl LocalLlm {
         generated_tokens.push(next_token);
         self.pending_token = Some(next_token);
 
-        if let Ok(decoded) = self.tokenizer.decode(&generated_tokens, true) {
-            if decoded.len() > prev_decoded_len {
-                if !on_token(&decoded[prev_decoded_len..]) {
-                    return Ok(decoded);
-                }
-                prev_decoded_len = decoded.len();
+        if let Ok(Some(piece)) = decoder.push_token(&self.tokenizer, next_token) {
+            if !on_token(&piece) {
+                return self
+                    .tokenizer
+                    .decode(&generated_tokens, true)
+                    .map_err(|e| anyhow!("Dekodingsfeil: {}", e));
             }
         }
 
@@ -3292,15 +3381,15 @@ impl LocalLlm {
                 break;
             }
 
-            if let Ok(decoded) = self.tokenizer.decode(&generated_tokens, true) {
-                if decoded.len() > prev_decoded_len {
-                    let piece = &decoded[prev_decoded_len..];
-                    if !on_token(piece) {
-                        break;
-                    }
-                    prev_decoded_len = decoded.len();
+            if let Ok(Some(piece)) = decoder.push_token(&self.tokenizer, next_token) {
+                if !on_token(&piece) {
+                    break;
                 }
             }
+        }
+
+        if let Ok(Some(rest)) = decoder.finish(&self.tokenizer) {
+            let _ = on_token(&rest);
         }
 
         if self.pending_token.is_some() {
@@ -3343,7 +3432,7 @@ impl LocalLlm {
         {
             on_status("Fullfører påbegynt setning (gjenbruker hurtigbuffer)...");
             let mut tail_tokens: Vec<u32> = Vec::new();
-            let mut prev_len = 0usize;
+            let mut tail_decoder = FastIncrementalDecoder::new();
             let extra_budget = (max_tokens / 2).clamp(80, 260);
 
             for step in 0..extra_budget {
@@ -3373,20 +3462,21 @@ impl LocalLlm {
                     break;
                 }
 
-                if let Ok(decoded) = self.tokenizer.decode(&tail_tokens, true) {
-                    if decoded.len() > prev_len {
-                        let piece = &decoded[prev_len..];
-                        accumulated_answer.push_str(piece);
-                        if !on_token(piece) {
-                            return Ok(accumulated_answer);
-                        }
-                        prev_len = decoded.len();
+                if let Ok(Some(piece)) = tail_decoder.push_token(&self.tokenizer, next_token) {
+                    accumulated_answer.push_str(&piece);
+                    if !on_token(&piece) {
+                        return Ok(accumulated_answer);
                     }
                 }
 
                 if step >= 24 && !looks_cut_off(&accumulated_answer) {
                     break;
                 }
+            }
+
+            if let Ok(Some(rest)) = tail_decoder.finish(&self.tokenizer) {
+                accumulated_answer.push_str(&rest);
+                let _ = on_token(&rest);
             }
         }
 
@@ -3441,7 +3531,6 @@ impl LocalLlm {
 
             let mut round_tokens: Vec<u32> = vec![next_token];
             self.pending_token = Some(next_token);
-            let mut prev_decoded_len = 0usize;
             let mut eval_buffer = String::new();
             let mut streaming_started = false;
             let mut added_any_text = false;
@@ -3466,11 +3555,9 @@ impl LocalLlm {
                 true
             };
 
-            if let Ok(decoded) = self.tokenizer.decode(&round_tokens, true) {
-                if decoded.len() > prev_decoded_len {
-                    eval_buffer.push_str(&decoded[prev_decoded_len..]);
-                    prev_decoded_len = decoded.len();
-                }
+            let mut round_decoder = FastIncrementalDecoder::new();
+            if let Ok(Some(piece)) = round_decoder.push_token(&self.tokenizer, next_token) {
+                eval_buffer.push_str(&piece);
             }
 
             let round_budget = ((max_tokens * 3) / 4).max(160);
@@ -3524,20 +3611,26 @@ impl LocalLlm {
                     break;
                 }
 
-                if let Ok(decoded) = self.tokenizer.decode(&round_tokens, true) {
-                    if decoded.len() > prev_decoded_len {
-                        let piece = &decoded[prev_decoded_len..];
-                        prev_decoded_len = decoded.len();
-                        if streaming_started {
-                            accumulated_answer.push_str(piece);
-                            added_any_text = true;
-                            if !on_token(piece) {
-                                return Ok(accumulated_answer);
-                            }
-                        } else {
-                            eval_buffer.push_str(piece);
+                if let Ok(Some(piece)) = round_decoder.push_token(&self.tokenizer, next_token) {
+                    if streaming_started {
+                        accumulated_answer.push_str(&piece);
+                        added_any_text = true;
+                        if !on_token(&piece) {
+                            return Ok(accumulated_answer);
                         }
+                    } else {
+                        eval_buffer.push_str(&piece);
                     }
+                }
+            }
+
+            if let Ok(Some(rest)) = round_decoder.finish(&self.tokenizer) {
+                if streaming_started {
+                    accumulated_answer.push_str(&rest);
+                    added_any_text = true;
+                    let _ = on_token(&rest);
+                } else {
+                    eval_buffer.push_str(&rest);
                 }
             }
 

@@ -375,7 +375,7 @@ impl CudaEngine {
                 }),
                 offloaded_bytes: AtomicUsize::new(0),
                 offloaded_tensors: AtomicUsize::new(0),
-                max_grid_x: AtomicU32::new(144),
+                max_grid_x: AtomicU32::new(512),
             }))
         }
         #[cfg(not(windows))]
@@ -614,7 +614,6 @@ impl CudaEngine {
                 return None;
             }
 
-            let mut results = Vec::with_capacity(targets.len());
             let mut offset_bytes = 0usize;
 
             for &(buf, n) in targets {
@@ -626,21 +625,24 @@ impl CudaEngine {
                 offset_bytes += slice_bytes;
             }
 
-            offset_bytes = 0;
+            // Én enkelt sammenhengende DtoH DMA-overføring for alle delmatriser (Q, K, V, etc.)
+            // Dette eliminerer PCIe driver-ventetid og 3-4 separate synkroniseringsrunder per lag!
+            let mut flat_results = vec![0.0f32; m * total_n];
+            if (self.cu_memcpy_dtoh)(
+                flat_results.as_mut_ptr() as *mut c_void,
+                ws.d_out,
+                total_out_bytes,
+            ) != 0
+            {
+                return None;
+            }
+
+            let mut results = Vec::with_capacity(targets.len());
+            let mut current_offset = 0usize;
             for &(_, n) in targets {
-                let d_out_slice = ws.d_out + (offset_bytes as u64);
-                let slice_bytes = m * n * 4;
-                let mut out_vec = vec![0.0f32; m * n];
-                if (self.cu_memcpy_dtoh)(
-                    out_vec.as_mut_ptr() as *mut c_void,
-                    d_out_slice,
-                    slice_bytes,
-                ) != 0
-                {
-                    return None;
-                }
-                results.push(out_vec);
-                offset_bytes += slice_bytes;
+                let count = m * n;
+                results.push(flat_results[current_offset..current_offset + count].to_vec());
+                current_offset += count;
             }
 
             Some(results)
