@@ -364,17 +364,30 @@ cargo build --release
 ```
 
 ### Starte grafisk grensesnitt (GUI)
+Kjør enten batch-skriptet eller PowerShell direkte:
+```cmd
+run.bat
+```
+eller
 ```powershell
-cargo run --release
+.\run.ps1
 ```
 
 ### Starte kommandolinjegrensesnitt (CLI)
+```cmd
+run-cli.bat
+```
+eller
 ```powershell
-cargo run --release -- --cli
+.\run-cli.ps1
 ```
 
 ### Bygge Windows MSI-installasjonspakke
-For å bygge en frittstående Windows MSI-installasjonspakke (`HuggingFaceLocalAssistant.msi`):
+For å bygge en frittstående Windows MSI-installasjonspakke (`HuggingFaceLocalAssistant.msi`), kjør enten batch-skriptet eller PowerShell:
+```cmd
+build_msi.bat
+```
+eller
 ```powershell
 powershell -ExecutionPolicy Bypass -File installer\build_msi.ps1
 ```
